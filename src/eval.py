@@ -42,13 +42,13 @@ def evaluate(cfg):
             use_cugraph=cfg.get("use_cugraph", False),
             use_torch=cfg.get("use_torch_bpr", False),
             device=cfg.get("device", "cpu"),
-            reward_mode=cfg.get("reward_mode", "delta"),
+            reward_mode=cfg.get("reward_mode", "log_delta"),
             reward_alpha=cfg.get("reward_alpha", 1.0),
             reward_beta=cfg.get("reward_beta", 10.0),
             reward_gamma=cfg.get("reward_gamma", 0.1),
             reward_clip=cfg.get("reward_clip", 0.0),
             capacity_damage=cfg.get("capacity_damage", 1e-3),
-            unassigned_penalty=cfg.get("unassigned_penalty", 1e9),
+            unassigned_penalty=cfg.get("unassigned_penalty", 2e7),
             seed=seed,
         )
 
@@ -56,14 +56,14 @@ def evaluate(cfg):
         baselines = get_baseline_policies(env)
         for name, policy in baselines.items():
             result = run_episode(env, policy)
-            result["auc"] = float(np.trapz(result["tstt_curve"]))
+            result["auc"] = float(np.trapezoid(result["tstt_curve"]))
             results[name] = result
 
         if model_path and os.path.exists(model_path):
             device = torch.device(cfg.get("device", "cpu"))
             agent = DiscreteSAC(
-                node_in=2,
-                edge_in=5,
+                node_in=3,
+                edge_in=6,
                 hidden=cfg["hidden_dim"],
                 embed=cfg["embed_dim"],
                 num_layers=cfg.get("gat_layers", 3),
@@ -82,7 +82,7 @@ def evaluate(cfg):
                 out = agent.select_action(node_x, edge_index, edge_attr, action_mask, deterministic=True)
                 state, reward, done, info = env.step(out.action)
                 tstt_curve.append(info["tstt"])
-            results["sac"] = {"tstt_curve": tstt_curve, "auc": float(np.trapz(tstt_curve))}
+            results["sac"] = {"tstt_curve": tstt_curve, "auc": float(np.trapezoid(tstt_curve))}
 
         all_results[f"seed_{seed}"] = results
 

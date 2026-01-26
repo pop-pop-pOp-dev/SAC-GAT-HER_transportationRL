@@ -31,7 +31,7 @@ class RepairEnv:
         use_cugraph: bool = False,
         use_torch: bool = False,
         device: str = "cpu",
-        reward_mode: str = "delta",
+        reward_mode: str = "log_delta",
         reward_alpha: float = 1.0,
         reward_beta: float = 10.0,
         reward_gamma: float = 0.1,
@@ -328,6 +328,9 @@ class RepairEnv:
 
     def get_state(self) -> EnvState:
         log_tstt = np.log10(max(self.tstt, 1e-6))
+        goal_total = float(np.sum(self.goal_mask))
+        remaining = float(np.sum(self.goal_mask * self.is_damaged))
+        remaining_ratio = remaining / max(goal_total, 1.0)
         # dynamic betweenness based on current connectivity
         active_edges = [
             (u, v)
@@ -350,9 +353,12 @@ class RepairEnv:
             [
                 bw_vec,
                 np.full(self.num_nodes, log_tstt, dtype=np.float32),
+                np.full(self.num_nodes, remaining_ratio, dtype=np.float32),
             ],
             axis=1,
         )
+
+        edge_id_norm = np.arange(self.num_edges, dtype=np.float32) / max(self.num_edges - 1, 1)
 
         edge_features = np.stack(
             [
@@ -361,6 +367,7 @@ class RepairEnv:
                 vc,
                 self.is_damaged,
                 self.goal_mask,
+                edge_id_norm,
             ],
             axis=1,
         )
