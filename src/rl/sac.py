@@ -202,8 +202,8 @@ class DiscreteSAC:
                 target_entropy = (0.6 * torch.log(valid + 1e-8)).mean()
             else:
                 target_entropy = self.target_entropy
-            log_probs = torch.log(probs + 1e-8)
-            alpha_term = scatter_sum(probs * (log_probs + target_entropy).detach(), edge_batch, dim=0)
+            log_probs = torch.log(probs + 1e-8).detach()
+            alpha_term = scatter_sum(probs.detach() * (log_probs + target_entropy), edge_batch, dim=0)
             alpha_losses.append(-(self.log_alpha * alpha_term).mean())
 
         critic_loss = torch.stack(critic_losses).mean()

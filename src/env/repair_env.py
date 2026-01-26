@@ -339,6 +339,9 @@ class RepairEnv:
             bw_vec = np.array([current_bw.get(i, 0.0) for i in range(self.num_nodes)], dtype=np.float32)
         else:
             bw_vec = np.zeros(self.num_nodes, dtype=np.float32)
+        bw_max = float(np.max(bw_vec)) if bw_vec.size else 0.0
+        if bw_max > 0:
+            bw_vec = bw_vec / bw_max
 
         raw_vc = np.zeros(self.num_edges, dtype=np.float32)
         for i in range(self.num_edges):

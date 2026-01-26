@@ -66,20 +66,27 @@ def to_torch(state, device):
     return node_x, edge_index, edge_attr, action_mask
 
 
-def build_pyg_batch(states, device):
-    data_list = []
-    action_masks = []
-    for s in states:
-        data = Data(
-            x=torch.tensor(s.node_features, dtype=torch.float32),
-            edge_index=torch.tensor(s.edge_index, dtype=torch.long),
-            edge_attr=torch.tensor(s.edge_features, dtype=torch.float32),
-        )
-        data_list.append(data)
-        action_masks.append(torch.tensor(s.action_mask, dtype=torch.float32))
+def state_to_data(state: EnvState) -> Data:
+    return Data(
+        x=torch.tensor(state.node_features, dtype=torch.float32),
+        edge_index=torch.tensor(state.edge_index, dtype=torch.long),
+        edge_attr=torch.tensor(state.edge_features, dtype=torch.float32),
+    )
+
+
+def build_pyg_batch_from_data(data_list, action_masks, device):
     batch = Batch.from_data_list(data_list).to(device)
-    action_mask = torch.cat(action_masks, dim=0).to(device)
+    action_mask = torch.cat(
+        [torch.tensor(mask, dtype=torch.float32) for mask in action_masks],
+        dim=0,
+    ).to(device)
     return batch, action_mask
+
+
+def build_pyg_batch(states, device):
+    data_list = [state_to_data(s) for s in states]
+    action_masks = [s.action_mask for s in states]
+    return build_pyg_batch_from_data(data_list, action_masks, device)
 
 
 def apply_goal(state: EnvState, goal: np.ndarray) -> EnvState:
@@ -212,7 +219,22 @@ def train(cfg):
             delta_tstt = prev_tstt - next_tstt
             episode_tstt.append(next_tstt)
             scaled_reward = reward * reward_scale
-            replay.add((state, out.action, scaled_reward, next_state, float(done), state.goal_mask, prev_tstt, next_tstt))
+            state_data = state_to_data(state)
+            next_state_data = state_to_data(next_state)
+            replay.add(
+                (
+                    state,
+                    out.action,
+                    scaled_reward,
+                    next_state,
+                    float(done),
+                    state.goal_mask,
+                    prev_tstt,
+                    next_tstt,
+                    state_data,
+                    next_state_data,
+                )
+            )
             state = next_state
             episode_reward += scaled_reward
             steps += 1
@@ -228,7 +250,9 @@ def train(cfg):
                 actions = []
                 rewards = []
                 dones = []
-                for s, a, r, s2, d, goal, prev_t, next_t in batch_items:
+                data_list = []
+                next_data_list = []
+                for s, a, r, s2, d, goal, prev_t, next_t, s_data, s2_data in batch_items:
                     if her_ratio > 0 and np.random.rand() < her_ratio:
                         achieved_goal = (1.0 - s2.action_mask).astype(np.float32)
                         goal = achieved_goal
@@ -246,13 +270,25 @@ def train(cfg):
                         d = float(env.is_goal_complete(goal, s2.action_mask))
                         s = apply_goal(s, goal)
                         s2 = apply_goal(s2, goal)
+                        s_data = state_to_data(s)
+                        s2_data = state_to_data(s2)
                     states.append(s)
                     next_states.append(s2)
+                    data_list.append(s_data)
+                    next_data_list.append(s2_data)
                     actions.append(a)
                     rewards.append(r)
                     dones.append(d)
-                batch_state, action_mask = build_pyg_batch(states, device)
-                batch_next_state, next_action_mask = build_pyg_batch(next_states, device)
+                batch_state, action_mask = build_pyg_batch_from_data(
+                    data_list,
+                    [s.action_mask for s in states],
+                    device,
+                )
+                batch_next_state, next_action_mask = build_pyg_batch_from_data(
+                    next_data_list,
+                    [s.action_mask for s in next_states],
+                    device,
+                )
                 edge_batch = batch_state.batch[batch_state.edge_index[0]]
                 global_actions = []
                 for i, a in enumerate(actions):

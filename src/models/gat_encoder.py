@@ -18,14 +18,17 @@ class GATEncoder(nn.Module):
 
     def forward(self, x, edge_index, batch, return_attention: bool = False):
         attn = None
-        x_skip = self.input_proj(x)
         for i, layer in enumerate(self.layers):
             if i == len(self.layers) - 1 and return_attention:
                 x, attn_info = layer(x, edge_index, return_attention_weights=True)
                 attn = attn_info[1]
-            else:
+            elif i == len(self.layers) - 1:
                 x = layer(x, edge_index)
-            if i != len(self.layers) - 1:
-                x = torch.relu(x + x_skip)
+            else:
+                x_in = x
+                x = layer(x, edge_index)
+                if i == 0:
+                    x_in = self.input_proj(x_in)
+                x = torch.relu(x + x_in)
         global_ctx = global_mean_pool(x, batch)
         return x, global_ctx, attn
