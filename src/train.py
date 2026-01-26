@@ -125,14 +125,20 @@ def train(cfg):
     )
 
     agent = DiscreteSAC(
-        node_in=2,
-        edge_in=5,
+        node_in=3,
+        edge_in=6,
         hidden=cfg["hidden_dim"],
         embed=cfg["embed_dim"],
         num_layers=cfg.get("gat_layers", 3),
         lr=cfg["lr"],
+        actor_lr=cfg.get("actor_lr"),
+        critic_lr=cfg.get("critic_lr"),
+        alpha_lr=cfg.get("alpha_lr"),
+        grad_clip=cfg.get("grad_clip"),
         gamma=cfg["gamma"],
         target_tau=cfg["target_tau"],
+        share_critic_encoder=cfg.get("share_critic_encoder", True),
+        alpha_init=cfg.get("alpha_init", 0.1),
     )
     agent.actor.to(device)
     agent.critic1.to(device)
@@ -162,11 +168,34 @@ def train(cfg):
     plot_every = int(cfg.get("plot_every", 1))
     reward_scale = float(cfg.get("reward_scale", 1.0))
     reward_mode = str(cfg.get("reward_mode", "delta"))
+    reward_alpha = float(cfg.get("reward_alpha", 1.0))
+    reward_beta = float(cfg.get("reward_beta", 10.0))
+    reward_gamma = float(cfg.get("reward_gamma", 0.1))
+    reward_clip = float(cfg.get("reward_clip", 0.0))
     max_steps = int(cfg.get("max_steps", 0))
     her_ratio = float(cfg.get("her_ratio", 0.0))
     alpha_max = cfg.get("alpha_max")
     save_best = bool(cfg.get("save_best", True))
     best_auc = float("inf")
+    smooth_window = int(cfg.get("smooth_window", 10))
+
+    def smooth_series(values, window):
+        if window <= 1:
+            return np.asarray(values, dtype=np.float32)
+        arr = np.asarray(values, dtype=np.float32)
+        if arr.size == 0:
+            return arr
+        window = min(int(window), int(arr.size))
+        if window <= 1:
+            return arr
+        mask = ~np.isnan(arr)
+        filled = np.where(mask, arr, 0.0)
+        kernel = np.ones(window, dtype=np.float32)
+        numer = np.convolve(filled, kernel, mode="same")
+        denom = np.convolve(mask.astype(np.float32), kernel, mode="same")
+        smoothed = np.divide(numer, np.maximum(denom, 1.0))
+        smoothed[denom == 0] = np.nan
+        return smoothed
     for episode in tqdm(range(cfg["episodes"])):
         state = env.reset(damaged_ratio=cfg["damaged_ratio"])
         done = False
@@ -203,7 +232,17 @@ def train(cfg):
                     if her_ratio > 0 and np.random.rand() < her_ratio:
                         achieved_goal = (1.0 - s2.action_mask).astype(np.float32)
                         goal = achieved_goal
-                        r = env.compute_reward_with_goal(prev_t, next_t, goal, s2.action_mask, mode=reward_mode) * reward_scale
+                        r = env.compute_reward_with_goal(
+                            prev_t,
+                            next_t,
+                            goal,
+                            s2.action_mask,
+                            alpha=reward_alpha,
+                            beta=reward_beta,
+                            gamma=reward_gamma,
+                            mode=reward_mode,
+                            clip=reward_clip,
+                        ) * reward_scale
                         d = float(env.is_goal_complete(goal, s2.action_mask))
                         s = apply_goal(s, goal)
                         s2 = apply_goal(s2, goal)
@@ -267,37 +306,52 @@ def train(cfg):
         if plot_every > 0 and (episode + 1) % plot_every == 0:
             fig, axes = plt.subplots(3, 2, figsize=(12, 12), sharex=True)
             x = np.arange(len(reward_hist))
+            reward_smooth = smooth_series(reward_hist, smooth_window)
             axes[0, 0].plot(x, reward_hist, color="#1f77b4", label="Reward")
+            axes[0, 0].plot(x, reward_smooth, color="#1f77b4", linestyle="--", label="Reward (smoothed)")
             axes[0, 0].set_title("Reward")
             axes[0, 0].set_xlabel("Episode")
             axes[0, 0].set_ylabel("Scaled Reward")
             axes[0, 0].legend()
 
+            tstt_mean_smooth = smooth_series(tstt_mean_hist, smooth_window)
             axes[0, 1].plot(x, tstt_mean_hist, color="#2ca02c", label="TSTT Mean")
+            axes[0, 1].plot(x, tstt_mean_smooth, color="#2ca02c", linestyle="--", label="TSTT Mean (smoothed)")
             axes[0, 1].set_title("TSTT Mean")
             axes[0, 1].set_xlabel("Episode")
             axes[0, 1].set_ylabel("TSTT")
             axes[0, 1].legend()
 
+            tstt_auc_smooth = smooth_series(tstt_auc_hist, smooth_window)
             axes[1, 0].plot(x, tstt_auc_hist, color="#9467bd", label="TSTT AUC")
+            axes[1, 0].plot(x, tstt_auc_smooth, color="#9467bd", linestyle="--", label="TSTT AUC (smoothed)")
             axes[1, 0].set_title("TSTT AUC")
             axes[1, 0].set_xlabel("Episode")
             axes[1, 0].set_ylabel("AUC")
             axes[1, 0].legend()
 
-            axes[1, 1].plot(x, [v if v is not None else np.nan for v in critic_hist], color="#d62728", label="Critic Loss")
+            critic_vals = [v if v is not None else np.nan for v in critic_hist]
+            critic_smooth = smooth_series(critic_vals, smooth_window)
+            axes[1, 1].plot(x, critic_vals, color="#d62728", label="Critic Loss")
+            axes[1, 1].plot(x, critic_smooth, color="#d62728", linestyle="--", label="Critic Loss (smoothed)")
             axes[1, 1].set_title("Critic Loss")
             axes[1, 1].set_xlabel("Episode")
             axes[1, 1].set_ylabel("Loss")
             axes[1, 1].legend()
 
-            axes[2, 0].plot(x, [v if v is not None else np.nan for v in actor_hist], color="#ff7f0e", label="Actor Loss")
+            actor_vals = [v if v is not None else np.nan for v in actor_hist]
+            actor_smooth = smooth_series(actor_vals, smooth_window)
+            axes[2, 0].plot(x, actor_vals, color="#ff7f0e", label="Actor Loss")
+            axes[2, 0].plot(x, actor_smooth, color="#ff7f0e", linestyle="--", label="Actor Loss (smoothed)")
             axes[2, 0].set_title("Actor Loss")
             axes[2, 0].set_xlabel("Episode")
             axes[2, 0].set_ylabel("Loss")
             axes[2, 0].legend()
 
-            axes[2, 1].plot(x, [m["tstt_last"] for m in metrics], color="#8c564b", label="TSTT Last")
+            tstt_last_vals = [m["tstt_last"] for m in metrics]
+            tstt_last_smooth = smooth_series(tstt_last_vals, smooth_window)
+            axes[2, 1].plot(x, tstt_last_vals, color="#8c564b", label="TSTT Last")
+            axes[2, 1].plot(x, tstt_last_smooth, color="#8c564b", linestyle="--", label="TSTT Last (smoothed)")
             axes[2, 1].set_title("TSTT Last (Episode End)")
             axes[2, 1].set_xlabel("Episode")
             axes[2, 1].set_ylabel("TSTT")
@@ -314,37 +368,52 @@ def train(cfg):
     if plot_every <= 0:
         fig, axes = plt.subplots(3, 2, figsize=(12, 12), sharex=True)
         x = np.arange(len(reward_hist))
+        reward_smooth = smooth_series(reward_hist, smooth_window)
         axes[0, 0].plot(x, reward_hist, color="#1f77b4", label="Reward")
+        axes[0, 0].plot(x, reward_smooth, color="#1f77b4", linestyle="--", label="Reward (smoothed)")
         axes[0, 0].set_title("Reward")
         axes[0, 0].set_xlabel("Episode")
         axes[0, 0].set_ylabel("Scaled Reward")
         axes[0, 0].legend()
 
+        tstt_mean_smooth = smooth_series(tstt_mean_hist, smooth_window)
         axes[0, 1].plot(x, tstt_mean_hist, color="#2ca02c", label="TSTT Mean")
+        axes[0, 1].plot(x, tstt_mean_smooth, color="#2ca02c", linestyle="--", label="TSTT Mean (smoothed)")
         axes[0, 1].set_title("TSTT Mean")
         axes[0, 1].set_xlabel("Episode")
         axes[0, 1].set_ylabel("TSTT")
         axes[0, 1].legend()
 
+        tstt_auc_smooth = smooth_series(tstt_auc_hist, smooth_window)
         axes[1, 0].plot(x, tstt_auc_hist, color="#9467bd", label="TSTT AUC")
+        axes[1, 0].plot(x, tstt_auc_smooth, color="#9467bd", linestyle="--", label="TSTT AUC (smoothed)")
         axes[1, 0].set_title("TSTT AUC")
         axes[1, 0].set_xlabel("Episode")
         axes[1, 0].set_ylabel("AUC")
         axes[1, 0].legend()
 
-        axes[1, 1].plot(x, [v if v is not None else np.nan for v in critic_hist], color="#d62728", label="Critic Loss")
+        critic_vals = [v if v is not None else np.nan for v in critic_hist]
+        critic_smooth = smooth_series(critic_vals, smooth_window)
+        axes[1, 1].plot(x, critic_vals, color="#d62728", label="Critic Loss")
+        axes[1, 1].plot(x, critic_smooth, color="#d62728", linestyle="--", label="Critic Loss (smoothed)")
         axes[1, 1].set_title("Critic Loss")
         axes[1, 1].set_xlabel("Episode")
         axes[1, 1].set_ylabel("Loss")
         axes[1, 1].legend()
 
-        axes[2, 0].plot(x, [v if v is not None else np.nan for v in actor_hist], color="#ff7f0e", label="Actor Loss")
+        actor_vals = [v if v is not None else np.nan for v in actor_hist]
+        actor_smooth = smooth_series(actor_vals, smooth_window)
+        axes[2, 0].plot(x, actor_vals, color="#ff7f0e", label="Actor Loss")
+        axes[2, 0].plot(x, actor_smooth, color="#ff7f0e", linestyle="--", label="Actor Loss (smoothed)")
         axes[2, 0].set_title("Actor Loss")
         axes[2, 0].set_xlabel("Episode")
         axes[2, 0].set_ylabel("Loss")
         axes[2, 0].legend()
 
-        axes[2, 1].plot(x, [m["tstt_last"] for m in metrics], color="#8c564b", label="TSTT Last")
+        tstt_last_vals = [m["tstt_last"] for m in metrics]
+        tstt_last_smooth = smooth_series(tstt_last_vals, smooth_window)
+        axes[2, 1].plot(x, tstt_last_vals, color="#8c564b", label="TSTT Last")
+        axes[2, 1].plot(x, tstt_last_smooth, color="#8c564b", linestyle="--", label="TSTT Last (smoothed)")
         axes[2, 1].set_title("TSTT Last (Episode End)")
         axes[2, 1].set_xlabel("Episode")
         axes[2, 1].set_ylabel("TSTT")

@@ -42,8 +42,8 @@ def main():
 
     device = torch.device(cfg.get("device", "cpu"))
     agent = DiscreteSAC(
-        node_in=2,
-        edge_in=4,
+        node_in=3,
+        edge_in=6,
         hidden=cfg["hidden_dim"],
         embed=cfg["embed_dim"],
         lr=cfg["lr"],

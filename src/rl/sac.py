@@ -43,9 +43,17 @@ class Actor(nn.Module):
 
 
 class Critic(nn.Module):
-    def __init__(self, node_in: int, edge_in: int, hidden: int, embed: int, num_layers: int = 3):
+    def __init__(
+        self,
+        node_in: int,
+        edge_in: int,
+        hidden: int,
+        embed: int,
+        num_layers: int = 3,
+        encoder: GATEncoder | None = None,
+    ):
         super().__init__()
-        self.encoder = GATEncoder(node_in, hidden, embed, num_layers=num_layers)
+        self.encoder = encoder if encoder is not None else GATEncoder(node_in, hidden, embed, num_layers=num_layers)
         self.edge_mlp = nn.Sequential(
             nn.Linear(embed * 3 + edge_in, hidden),
             nn.ReLU(),
@@ -71,27 +79,55 @@ class DiscreteSAC:
         embed: int,
         num_layers: int = 3,
         lr: float = 3e-4,
+        actor_lr: float | None = None,
+        critic_lr: float | None = None,
+        alpha_lr: float | None = None,
+        grad_clip: float | None = None,
         gamma: float = 0.99,
         target_tau: float = 0.005,
         target_entropy: float = None,
+        alpha_init: float = 0.1,
+        share_critic_encoder: bool = True,
     ):
         self.actor = Actor(node_in, edge_in, hidden, embed, num_layers=num_layers)
-        self.critic1 = Critic(node_in, edge_in, hidden, embed, num_layers=num_layers)
-        self.critic2 = Critic(node_in, edge_in, hidden, embed, num_layers=num_layers)
-        self.target1 = Critic(node_in, edge_in, hidden, embed, num_layers=num_layers)
-        self.target2 = Critic(node_in, edge_in, hidden, embed, num_layers=num_layers)
-        self.target1.load_state_dict(self.critic1.state_dict())
-        self.target2.load_state_dict(self.critic2.state_dict())
+        self.share_critic_encoder = share_critic_encoder
+        if share_critic_encoder:
+            self.critic_encoder = GATEncoder(node_in, hidden, embed, num_layers=num_layers)
+            self.target_encoder = GATEncoder(node_in, hidden, embed, num_layers=num_layers)
+            self.critic1 = Critic(node_in, edge_in, hidden, embed, num_layers=num_layers, encoder=self.critic_encoder)
+            self.critic2 = Critic(node_in, edge_in, hidden, embed, num_layers=num_layers, encoder=self.critic_encoder)
+            self.target1 = Critic(node_in, edge_in, hidden, embed, num_layers=num_layers, encoder=self.target_encoder)
+            self.target2 = Critic(node_in, edge_in, hidden, embed, num_layers=num_layers, encoder=self.target_encoder)
+            self.target_encoder.load_state_dict(self.critic_encoder.state_dict())
+        else:
+            self.critic1 = Critic(node_in, edge_in, hidden, embed, num_layers=num_layers)
+            self.critic2 = Critic(node_in, edge_in, hidden, embed, num_layers=num_layers)
+            self.target1 = Critic(node_in, edge_in, hidden, embed, num_layers=num_layers)
+            self.target2 = Critic(node_in, edge_in, hidden, embed, num_layers=num_layers)
+            self.target1.load_state_dict(self.critic1.state_dict())
+            self.target2.load_state_dict(self.critic2.state_dict())
 
-        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=lr)
-        self.critic_opt = torch.optim.Adam(list(self.critic1.parameters()) + list(self.critic2.parameters()), lr=lr)
+        actor_lr = lr if actor_lr is None else actor_lr
+        critic_lr = lr if critic_lr is None else critic_lr
+        alpha_lr = lr if alpha_lr is None else alpha_lr
+        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
+        if share_critic_encoder:
+            critic_params = (
+                list(self.critic_encoder.parameters())
+                + list(self.critic1.edge_mlp.parameters())
+                + list(self.critic2.edge_mlp.parameters())
+            )
+        else:
+            critic_params = list(self.critic1.parameters()) + list(self.critic2.parameters())
+        self.critic_opt = torch.optim.Adam(critic_params, lr=critic_lr)
 
-        self.log_alpha = torch.tensor(0.0, requires_grad=True)
-        self.alpha_opt = torch.optim.Adam([self.log_alpha], lr=lr)
+        self.log_alpha = torch.tensor(float(np.log(max(alpha_init, 1e-8))), requires_grad=True)
+        self.alpha_opt = torch.optim.Adam([self.log_alpha], lr=alpha_lr)
 
         self.gamma = gamma
         self.target_tau = target_tau
         self.target_entropy = target_entropy
+        self.grad_clip = grad_clip
 
     @property
     def alpha(self):
@@ -174,20 +210,34 @@ class DiscreteSAC:
 
         self.critic_opt.zero_grad()
         critic_loss.backward()
+        if self.grad_clip is not None and self.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(
+                list(self.critic1.parameters()) + list(self.critic2.parameters()),
+                max_norm=self.grad_clip,
+            )
         self.critic_opt.step()
 
         self.actor_opt.zero_grad()
         actor_loss.backward()
+        if self.grad_clip is not None and self.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=self.grad_clip)
         self.actor_opt.step()
 
         self.alpha_opt.zero_grad()
         alpha_loss.backward()
+        if self.grad_clip is not None and self.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_([self.log_alpha], max_norm=self.grad_clip)
         self.alpha_opt.step()
         if alpha_max is not None:
             self.log_alpha.data.clamp_(max=float(np.log(alpha_max)))
 
-        self._soft_update(self.critic1, self.target1)
-        self._soft_update(self.critic2, self.target2)
+        if self.share_critic_encoder:
+            self._soft_update(self.critic_encoder, self.target_encoder)
+            self._soft_update(self.critic1.edge_mlp, self.target1.edge_mlp)
+            self._soft_update(self.critic2.edge_mlp, self.target2.edge_mlp)
+        else:
+            self._soft_update(self.critic1, self.target1)
+            self._soft_update(self.critic2, self.target2)
 
         return {
             "critic_loss": critic_loss.item(),
