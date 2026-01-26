@@ -327,10 +327,6 @@ class RepairEnv:
         return edges
 
     def get_state(self) -> EnvState:
-        log_tstt = np.log10(max(self.tstt, 1e-6))
-        goal_total = float(np.sum(self.goal_mask))
-        remaining = float(np.sum(self.goal_mask * self.is_damaged))
-        remaining_ratio = remaining / max(goal_total, 1.0)
         # dynamic betweenness based on current connectivity
         active_edges = [
             (u, v)
@@ -349,14 +345,7 @@ class RepairEnv:
             raw_vc[i] = self.flow[i] / max(self.capacities[i], 1e-6)
         vc = np.where(self.is_damaged > 0, 0.0, raw_vc)
 
-        node_features = np.stack(
-            [
-                bw_vec,
-                np.full(self.num_nodes, log_tstt, dtype=np.float32),
-                np.full(self.num_nodes, remaining_ratio, dtype=np.float32),
-            ],
-            axis=1,
-        )
+        node_features = np.stack([bw_vec], axis=1)
 
         edge_id_norm = np.arange(self.num_edges, dtype=np.float32) / max(self.num_edges - 1, 1)
 
@@ -378,6 +367,6 @@ class RepairEnv:
             edge_features=edge_features,
             edge_index=self.edge_index,
             action_mask=action_mask,
-            log_tstt=log_tstt,
+            log_tstt=0.0,
             goal_mask=self.goal_mask.copy(),
         )

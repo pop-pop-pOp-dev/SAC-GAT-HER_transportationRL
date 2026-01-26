@@ -125,7 +125,7 @@ def train(cfg):
     )
 
     agent = DiscreteSAC(
-        node_in=3,
+        node_in=1,
         edge_in=6,
         hidden=cfg["hidden_dim"],
         embed=cfg["embed_dim"],
