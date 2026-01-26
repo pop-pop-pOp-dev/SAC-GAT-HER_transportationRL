@@ -2,11 +2,11 @@ data_dir: ./data
 output_dir: ./outputs
 model_dir: ./outputs
 damaged_ratio: 0.3
-assignment_iters: 50
+assignment_iters: 20
 assignment_method: fw
 use_cugraph: false
 episodes: 1000
-buffer_size: 20000
+buffer_size: 10000
 batch_start: 50
 batch_size: 64
 per_alpha: 0.6
@@ -24,7 +24,7 @@ debug_reward: true
 debug_reward_every: 10
 max_steps: 150
 her_ratio: 0.2
-gat_layers: 5
+gat_layers: 3
 plot_every: 1
 hidden_dim: 64
 embed_dim: 64
