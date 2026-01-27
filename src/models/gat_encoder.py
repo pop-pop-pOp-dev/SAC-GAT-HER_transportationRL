@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torch_geometric.nn import GATConv, global_mean_pool, global_max_pool
 
 
@@ -45,6 +46,7 @@ class GATEncoder(nn.Module):
                 x = torch.relu(x + x_in)
                 continue
             x = self.norms[i](x)
+            x = F.elu(x)
         g_mean = global_mean_pool(x, batch)
         g_max = global_max_pool(x, batch)
         global_ctx = torch.cat([g_mean, g_max], dim=1)

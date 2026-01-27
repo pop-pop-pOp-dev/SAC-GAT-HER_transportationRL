@@ -204,6 +204,7 @@ class DiscreteSAC:
         log_probs = torch.log(probs + 1e-8).detach()
         alpha_term = scatter_sum(probs.detach() * (log_probs + target_entropy), edge_batch, dim=0)
         alpha_loss = -(self.log_alpha * alpha_term).mean()
+        entropy = scatter_sum(-(probs.detach() * log_probs), edge_batch, dim=0).mean()
 
         self.critic_opt.zero_grad()
         critic_loss.backward()
@@ -240,6 +241,8 @@ class DiscreteSAC:
             "critic_loss": critic_loss.item(),
             "actor_loss": actor_loss.item(),
             "alpha": self.alpha.item(),
+            "alpha_loss": alpha_loss.item(),
+            "policy_entropy": entropy.item(),
             "td_errors": td_errors_list,
         }
 

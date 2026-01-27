@@ -287,14 +287,13 @@ class RepairEnv:
 
     def compute_travel_time(self, flow: np.ndarray) -> np.ndarray:
         if not self.use_torch:
-            t = np.zeros(self.num_edges, dtype=np.float32)
-            for i in range(self.num_edges):
-                if self.is_damaged[i] == 1.0:
-                    t[i] = 1e6
-                    continue
-            vc = max(flow[i] / max(self.capacities[i], 1e-6), 0.0)
-            vc = min(vc, 4.0)
-            t[i] = self.t0[i] * (1.0 + self.bpr_alpha * (vc ** self.bpr_beta))
+            flow_np = np.asarray(flow, dtype=np.float32)
+            cap = np.maximum(self.capacities, 1e-6)
+            vc = np.clip(flow_np / cap, 0.0, 4.0)
+            t = self.t0 * (1.0 + self.bpr_alpha * (vc ** self.bpr_beta))
+            damaged_mask = self.is_damaged > 0.5
+            t = t.astype(np.float32)
+            t[damaged_mask] = 1e6
             return t
 
         import torch
@@ -309,7 +308,9 @@ class RepairEnv:
         return t.detach().cpu().numpy()
 
     def compute_tstt(self, flow: np.ndarray, t: np.ndarray, unassigned_demand: float = 0.0) -> float:
-        base = float(np.sum(flow * t))
+        flow_np = np.asarray(flow, dtype=np.float32)
+        t_np = np.asarray(t, dtype=np.float32)
+        base = float(np.sum(flow_np * t_np))
         total_demand = max(self.total_demand, 1.0)
         att_base = base / total_demand
         if unassigned_demand > 0:

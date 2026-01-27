@@ -166,6 +166,8 @@ def train(cfg):
     tstt_auc_hist = []
     critic_hist = []
     actor_hist = []
+    alpha_loss_hist = []
+    entropy_hist = []
     tb_dir = os.path.join(cfg["output_dir"], "tb")
     writer = SummaryWriter(log_dir=tb_dir)
     os.makedirs(cfg["output_dir"], exist_ok=True)
@@ -332,6 +334,8 @@ def train(cfg):
         tstt_auc_hist.append(tstt_auc)
         critic_hist.append(last_losses.get("critic_loss") if last_losses else None)
         actor_hist.append(last_losses.get("actor_loss") if last_losses else None)
+        alpha_loss_hist.append(last_losses.get("alpha_loss") if last_losses else None)
+        entropy_hist.append(last_losses.get("policy_entropy") if last_losses else None)
         writer.add_scalar("train/reward", episode_reward, episode)
         writer.add_scalar("train/tstt_mean", tstt_mean, episode)
         writer.add_scalar("train/tstt_auc", tstt_auc, episode)
@@ -339,12 +343,14 @@ def train(cfg):
             writer.add_scalar("train/critic_loss", last_losses.get("critic_loss", 0.0), episode)
             writer.add_scalar("train/actor_loss", last_losses.get("actor_loss", 0.0), episode)
             writer.add_scalar("train/alpha", last_losses.get("alpha", 0.0), episode)
+            writer.add_scalar("train/alpha_loss", last_losses.get("alpha_loss", 0.0), episode)
+            writer.add_scalar("train/policy_entropy", last_losses.get("policy_entropy", 0.0), episode)
         if plot_every > 0 and (episode + 1) % plot_every == 0:
-            fig, axes = plt.subplots(3, 2, figsize=(12, 12), sharex=True)
+            fig, axes = plt.subplots(4, 2, figsize=(12, 16), sharex=True)
             x = np.arange(len(reward_hist))
             reward_smooth = smooth_series(reward_hist, smooth_window)
             axes[0, 0].plot(x, reward_hist, color="#1f77b4", label="Reward")
-            axes[0, 0].plot(x, reward_smooth, color="#1f77b4", linestyle="--", label="Reward (smoothed)")
+            axes[0, 0].plot(x, reward_smooth, color="#1f9bff", linestyle="--", label="Reward (smoothed)")
             axes[0, 0].set_title("Reward")
             axes[0, 0].set_xlabel("Episode")
             axes[0, 0].set_ylabel("Scaled Reward")
@@ -352,7 +358,7 @@ def train(cfg):
 
             tstt_mean_smooth = smooth_series(tstt_mean_hist, smooth_window)
             axes[0, 1].plot(x, tstt_mean_hist, color="#2ca02c", label="TSTT Mean")
-            axes[0, 1].plot(x, tstt_mean_smooth, color="#2ca02c", linestyle="--", label="TSTT Mean (smoothed)")
+            axes[0, 1].plot(x, tstt_mean_smooth, color="#3bd23b", linestyle="--", label="TSTT Mean (smoothed)")
             axes[0, 1].set_title("TSTT Mean")
             axes[0, 1].set_xlabel("Episode")
             axes[0, 1].set_ylabel("TSTT")
@@ -360,7 +366,7 @@ def train(cfg):
 
             tstt_auc_smooth = smooth_series(tstt_auc_hist, smooth_window)
             axes[1, 0].plot(x, tstt_auc_hist, color="#9467bd", label="TSTT AUC")
-            axes[1, 0].plot(x, tstt_auc_smooth, color="#9467bd", linestyle="--", label="TSTT AUC (smoothed)")
+            axes[1, 0].plot(x, tstt_auc_smooth, color="#b27cf2", linestyle="--", label="TSTT AUC (smoothed)")
             axes[1, 0].set_title("TSTT AUC")
             axes[1, 0].set_xlabel("Episode")
             axes[1, 0].set_ylabel("AUC")
@@ -369,7 +375,7 @@ def train(cfg):
             critic_vals = [v if v is not None else np.nan for v in critic_hist]
             critic_smooth = smooth_series(critic_vals, smooth_window)
             axes[1, 1].plot(x, critic_vals, color="#d62728", label="Critic Loss")
-            axes[1, 1].plot(x, critic_smooth, color="#d62728", linestyle="--", label="Critic Loss (smoothed)")
+            axes[1, 1].plot(x, critic_smooth, color="#ff3b3b", linestyle="--", label="Critic Loss (smoothed)")
             axes[1, 1].set_title("Critic Loss")
             axes[1, 1].set_xlabel("Episode")
             axes[1, 1].set_ylabel("Loss")
@@ -378,7 +384,7 @@ def train(cfg):
             actor_vals = [v if v is not None else np.nan for v in actor_hist]
             actor_smooth = smooth_series(actor_vals, smooth_window)
             axes[2, 0].plot(x, actor_vals, color="#ff7f0e", label="Actor Loss")
-            axes[2, 0].plot(x, actor_smooth, color="#ff7f0e", linestyle="--", label="Actor Loss (smoothed)")
+            axes[2, 0].plot(x, actor_smooth, color="#ff9f2e", linestyle="--", label="Actor Loss (smoothed)")
             axes[2, 0].set_title("Actor Loss")
             axes[2, 0].set_xlabel("Episode")
             axes[2, 0].set_ylabel("Loss")
@@ -387,11 +393,29 @@ def train(cfg):
             tstt_last_vals = [m["tstt_last"] for m in metrics]
             tstt_last_smooth = smooth_series(tstt_last_vals, smooth_window)
             axes[2, 1].plot(x, tstt_last_vals, color="#8c564b", label="TSTT Last")
-            axes[2, 1].plot(x, tstt_last_smooth, color="#8c564b", linestyle="--", label="TSTT Last (smoothed)")
+            axes[2, 1].plot(x, tstt_last_smooth, color="#b06f61", linestyle="--", label="TSTT Last (smoothed)")
             axes[2, 1].set_title("TSTT Last (Episode End)")
             axes[2, 1].set_xlabel("Episode")
             axes[2, 1].set_ylabel("TSTT")
             axes[2, 1].legend()
+
+            alpha_loss_vals = [v if v is not None else np.nan for v in alpha_loss_hist]
+            alpha_loss_smooth = smooth_series(alpha_loss_vals, smooth_window)
+            axes[3, 0].plot(x, alpha_loss_vals, color="#17becf", label="Alpha Loss")
+            axes[3, 0].plot(x, alpha_loss_smooth, color="#3fe1f5", linestyle="--", label="Alpha Loss (smoothed)")
+            axes[3, 0].set_title("Alpha Loss")
+            axes[3, 0].set_xlabel("Episode")
+            axes[3, 0].set_ylabel("Loss")
+            axes[3, 0].legend()
+
+            entropy_vals = [v if v is not None else np.nan for v in entropy_hist]
+            entropy_smooth = smooth_series(entropy_vals, smooth_window)
+            axes[3, 1].plot(x, entropy_vals, color="#7f7f7f", label="Policy Entropy")
+            axes[3, 1].plot(x, entropy_smooth, color="#b3b3b3", linestyle="--", label="Policy Entropy (smoothed)")
+            axes[3, 1].set_title("Policy Entropy")
+            axes[3, 1].set_xlabel("Episode")
+            axes[3, 1].set_ylabel("Entropy")
+            axes[3, 1].legend()
 
             for ax in axes.ravel():
                 ax.grid(True, alpha=0.3)
@@ -402,11 +426,11 @@ def train(cfg):
     out_path = os.path.join(cfg["output_dir"], "train_metrics.npy")
     np.save(out_path, metrics)
     if plot_every <= 0:
-        fig, axes = plt.subplots(3, 2, figsize=(12, 12), sharex=True)
+        fig, axes = plt.subplots(4, 2, figsize=(12, 16), sharex=True)
         x = np.arange(len(reward_hist))
         reward_smooth = smooth_series(reward_hist, smooth_window)
         axes[0, 0].plot(x, reward_hist, color="#1f77b4", label="Reward")
-        axes[0, 0].plot(x, reward_smooth, color="#1f77b4", linestyle="--", label="Reward (smoothed)")
+        axes[0, 0].plot(x, reward_smooth, color="#1f9bff", linestyle="--", label="Reward (smoothed)")
         axes[0, 0].set_title("Reward")
         axes[0, 0].set_xlabel("Episode")
         axes[0, 0].set_ylabel("Scaled Reward")
@@ -414,7 +438,7 @@ def train(cfg):
 
         tstt_mean_smooth = smooth_series(tstt_mean_hist, smooth_window)
         axes[0, 1].plot(x, tstt_mean_hist, color="#2ca02c", label="TSTT Mean")
-        axes[0, 1].plot(x, tstt_mean_smooth, color="#2ca02c", linestyle="--", label="TSTT Mean (smoothed)")
+        axes[0, 1].plot(x, tstt_mean_smooth, color="#3bd23b", linestyle="--", label="TSTT Mean (smoothed)")
         axes[0, 1].set_title("TSTT Mean")
         axes[0, 1].set_xlabel("Episode")
         axes[0, 1].set_ylabel("TSTT")
@@ -422,7 +446,7 @@ def train(cfg):
 
         tstt_auc_smooth = smooth_series(tstt_auc_hist, smooth_window)
         axes[1, 0].plot(x, tstt_auc_hist, color="#9467bd", label="TSTT AUC")
-        axes[1, 0].plot(x, tstt_auc_smooth, color="#9467bd", linestyle="--", label="TSTT AUC (smoothed)")
+        axes[1, 0].plot(x, tstt_auc_smooth, color="#b27cf2", linestyle="--", label="TSTT AUC (smoothed)")
         axes[1, 0].set_title("TSTT AUC")
         axes[1, 0].set_xlabel("Episode")
         axes[1, 0].set_ylabel("AUC")
@@ -431,7 +455,7 @@ def train(cfg):
         critic_vals = [v if v is not None else np.nan for v in critic_hist]
         critic_smooth = smooth_series(critic_vals, smooth_window)
         axes[1, 1].plot(x, critic_vals, color="#d62728", label="Critic Loss")
-        axes[1, 1].plot(x, critic_smooth, color="#d62728", linestyle="--", label="Critic Loss (smoothed)")
+        axes[1, 1].plot(x, critic_smooth, color="#ff3b3b", linestyle="--", label="Critic Loss (smoothed)")
         axes[1, 1].set_title("Critic Loss")
         axes[1, 1].set_xlabel("Episode")
         axes[1, 1].set_ylabel("Loss")
@@ -440,7 +464,7 @@ def train(cfg):
         actor_vals = [v if v is not None else np.nan for v in actor_hist]
         actor_smooth = smooth_series(actor_vals, smooth_window)
         axes[2, 0].plot(x, actor_vals, color="#ff7f0e", label="Actor Loss")
-        axes[2, 0].plot(x, actor_smooth, color="#ff7f0e", linestyle="--", label="Actor Loss (smoothed)")
+        axes[2, 0].plot(x, actor_smooth, color="#ff9f2e", linestyle="--", label="Actor Loss (smoothed)")
         axes[2, 0].set_title("Actor Loss")
         axes[2, 0].set_xlabel("Episode")
         axes[2, 0].set_ylabel("Loss")
@@ -449,11 +473,29 @@ def train(cfg):
         tstt_last_vals = [m["tstt_last"] for m in metrics]
         tstt_last_smooth = smooth_series(tstt_last_vals, smooth_window)
         axes[2, 1].plot(x, tstt_last_vals, color="#8c564b", label="TSTT Last")
-        axes[2, 1].plot(x, tstt_last_smooth, color="#8c564b", linestyle="--", label="TSTT Last (smoothed)")
+        axes[2, 1].plot(x, tstt_last_smooth, color="#b06f61", linestyle="--", label="TSTT Last (smoothed)")
         axes[2, 1].set_title("TSTT Last (Episode End)")
         axes[2, 1].set_xlabel("Episode")
         axes[2, 1].set_ylabel("TSTT")
         axes[2, 1].legend()
+
+        alpha_loss_vals = [v if v is not None else np.nan for v in alpha_loss_hist]
+        alpha_loss_smooth = smooth_series(alpha_loss_vals, smooth_window)
+        axes[3, 0].plot(x, alpha_loss_vals, color="#17becf", label="Alpha Loss")
+        axes[3, 0].plot(x, alpha_loss_smooth, color="#3fe1f5", linestyle="--", label="Alpha Loss (smoothed)")
+        axes[3, 0].set_title("Alpha Loss")
+        axes[3, 0].set_xlabel("Episode")
+        axes[3, 0].set_ylabel("Loss")
+        axes[3, 0].legend()
+
+        entropy_vals = [v if v is not None else np.nan for v in entropy_hist]
+        entropy_smooth = smooth_series(entropy_vals, smooth_window)
+        axes[3, 1].plot(x, entropy_vals, color="#7f7f7f", label="Policy Entropy")
+        axes[3, 1].plot(x, entropy_smooth, color="#b3b3b3", linestyle="--", label="Policy Entropy (smoothed)")
+        axes[3, 1].set_title("Policy Entropy")
+        axes[3, 1].set_xlabel("Episode")
+        axes[3, 1].set_ylabel("Entropy")
+        axes[3, 1].legend()
 
         for ax in axes.ravel():
             ax.grid(True, alpha=0.3)
