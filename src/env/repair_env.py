@@ -347,6 +347,7 @@ class RepairEnv:
         for i in range(self.num_edges):
             raw_vc[i] = self.flow[i] / max(self.capacities[i], 1e-6)
         vc = np.where(self.is_damaged > 0, 0.0, raw_vc)
+        vc = np.log1p(vc)
 
         node_features = np.stack([bw_vec], axis=1)
 

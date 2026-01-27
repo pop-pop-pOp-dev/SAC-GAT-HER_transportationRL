@@ -23,15 +23,15 @@ class SACOutput:
 class Actor(nn.Module):
     def __init__(self, node_in: int, edge_in: int, hidden: int, embed: int, num_layers: int = 3):
         super().__init__()
-        self.encoder = GATEncoder(node_in, hidden, embed, num_layers=num_layers)
+        self.encoder = GATEncoder(node_in, hidden, embed, edge_dim=edge_in, num_layers=num_layers)
         self.edge_mlp = nn.Sequential(
-            nn.Linear(embed * 3 + edge_in, hidden),
+            nn.Linear(embed * 4 + edge_in, hidden),
             nn.ReLU(),
             nn.Linear(hidden, 1),
         )
 
     def forward(self, node_x, edge_index, edge_attr, action_mask, batch, return_attention: bool = False):
-        node_emb, global_ctx, attn = self.encoder(node_x, edge_index, batch, return_attention=return_attention)
+        node_emb, global_ctx, attn = self.encoder(node_x, edge_index, edge_attr, batch, return_attention=return_attention)
         src, dst = edge_index
         edge_batch = batch[edge_index[0]]
         ctx = global_ctx[edge_batch]
@@ -53,15 +53,15 @@ class Critic(nn.Module):
         encoder: GATEncoder | None = None,
     ):
         super().__init__()
-        self.encoder = encoder if encoder is not None else GATEncoder(node_in, hidden, embed, num_layers=num_layers)
+        self.encoder = encoder if encoder is not None else GATEncoder(node_in, hidden, embed, edge_dim=edge_in, num_layers=num_layers)
         self.edge_mlp = nn.Sequential(
-            nn.Linear(embed * 3 + edge_in, hidden),
+            nn.Linear(embed * 4 + edge_in, hidden),
             nn.ReLU(),
             nn.Linear(hidden, 1),
         )
 
     def forward(self, node_x, edge_index, edge_attr, batch):
-        node_emb, global_ctx, _ = self.encoder(node_x, edge_index, batch)
+        node_emb, global_ctx, _ = self.encoder(node_x, edge_index, edge_attr, batch)
         src, dst = edge_index
         edge_batch = batch[edge_index[0]]
         ctx = global_ctx[edge_batch]
@@ -92,8 +92,8 @@ class DiscreteSAC:
         self.actor = Actor(node_in, edge_in, hidden, embed, num_layers=num_layers)
         self.share_critic_encoder = share_critic_encoder
         if share_critic_encoder:
-            self.critic_encoder = GATEncoder(node_in, hidden, embed, num_layers=num_layers)
-            self.target_encoder = GATEncoder(node_in, hidden, embed, num_layers=num_layers)
+            self.critic_encoder = GATEncoder(node_in, hidden, embed, edge_dim=edge_in, num_layers=num_layers)
+            self.target_encoder = GATEncoder(node_in, hidden, embed, edge_dim=edge_in, num_layers=num_layers)
             self.critic1 = Critic(node_in, edge_in, hidden, embed, num_layers=num_layers, encoder=self.critic_encoder)
             self.critic2 = Critic(node_in, edge_in, hidden, embed, num_layers=num_layers, encoder=self.critic_encoder)
             self.target1 = Critic(node_in, edge_in, hidden, embed, num_layers=num_layers, encoder=self.target_encoder)
@@ -199,7 +199,7 @@ class DiscreteSAC:
 
             if self.target_entropy is None:
                 valid = scatter_sum((action_mask > 0).float(), edge_batch, dim=0)
-                target_entropy = (0.6 * torch.log(valid + 1e-8)).mean()
+                target_entropy = (-0.6 * torch.log(valid + 1e-8)).mean()
             else:
                 target_entropy = self.target_entropy
             log_probs = torch.log(probs + 1e-8).detach()
