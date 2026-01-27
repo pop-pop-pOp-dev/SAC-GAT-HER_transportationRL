@@ -110,7 +110,7 @@ class RepairEnv:
         if action_edge_id < 0 or action_edge_id >= self.num_edges:
             raise ValueError(f"action_edge_id {action_edge_id} out of range (0..{self.num_edges - 1})")
         if self.is_damaged[action_edge_id] == 0:
-            reward = -1.0
+            reward = -5.0
             return self.get_state(), reward, False, {"tstt": self.tstt}
 
         prev_tstt = self.tstt
@@ -366,11 +366,13 @@ class RepairEnv:
         )
 
         action_mask = self.is_damaged.astype(np.float32)
+        current_tstt = self.tstt if self.tstt is not None else self.initial_tstt
+        log_tstt_val = float(np.log10(max(current_tstt, 1.0))) if current_tstt is not None else 0.0
         return EnvState(
             node_features=node_features,
             edge_features=edge_features,
             edge_index=self.edge_index,
             action_mask=action_mask,
-            log_tstt=0.0,
+            log_tstt=log_tstt_val,
             goal_mask=self.goal_mask.copy(),
         )
