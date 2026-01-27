@@ -27,35 +27,64 @@ class ReplayBuffer:
     beta: float = 0.4
     eps: float = 1e-6
     data: List = None
-    priorities: List = None
+    tree: np.ndarray = None
+    max_priority: float = 1.0
     ptr: int = 0
     size: int = 0
 
     def __post_init__(self):
         self.data = [None] * self.capacity
-        self.priorities = [0.0] * self.capacity
+        self.tree = np.zeros(2 * self.capacity, dtype=np.float32)
+
+    def _set_priority(self, idx: int, priority: float) -> None:
+        tree_idx = idx + self.capacity
+        delta = priority - self.tree[tree_idx]
+        while tree_idx >= 1:
+            self.tree[tree_idx] += delta
+            tree_idx //= 2
 
     def add(self, item, priority: float = None):
         if priority is None:
-            priority = max(self.priorities) if self.size > 0 else 1.0
+            priority = self.max_priority
+        priority = float(abs(priority) + self.eps)
+        self.max_priority = max(self.max_priority, priority)
+        p = priority**self.alpha
         self.data[self.ptr] = item
-        self.priorities[self.ptr] = priority
+        self._set_priority(self.ptr, p)
         self.ptr = (self.ptr + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
 
     def sample(self, batch_size: int):
-        probs = np.array(self.priorities[: self.size], dtype=np.float32) ** self.alpha
-        probs /= probs.sum()
-        replace = batch_size > self.size
-        indices = np.random.choice(self.size, size=batch_size, replace=replace, p=probs)
-        weights = (self.size * probs[indices]) ** (-self.beta)
-        weights /= weights.max()
+        total = float(self.tree[1])
+        if total <= 0 or self.size == 0:
+            raise ValueError("Cannot sample from an empty replay buffer.")
+        indices = np.zeros(batch_size, dtype=np.int64)
+        priorities = np.zeros(batch_size, dtype=np.float32)
+        for i in range(batch_size):
+            r = np.random.rand() * total
+            idx = 1
+            while idx < self.capacity:
+                left = idx * 2
+                if r <= self.tree[left]:
+                    idx = left
+                else:
+                    r -= self.tree[left]
+                    idx = left + 1
+            data_idx = idx - self.capacity
+            indices[i] = data_idx
+            priorities[i] = self.tree[idx]
+        probs = priorities / total
+        weights = (self.size * probs) ** (-self.beta)
+        weights /= weights.max() if weights.max() > 0 else 1.0
         batch = [self.data[i] for i in indices]
-        return batch, indices, weights
+        return batch, indices, weights.astype(np.float32)
 
     def update_priorities(self, indices, td_errors):
         for i, err in zip(indices, td_errors):
-            self.priorities[i] = float(abs(err) + self.eps)
+            priority = float(abs(err) + self.eps)
+            self.max_priority = max(self.max_priority, priority)
+            p = priority**self.alpha
+            self._set_priority(int(i), p)
 
 
 def to_torch(state, device):
@@ -183,6 +212,8 @@ def train(cfg):
     reward_clip = float(cfg.get("reward_clip", 0.0))
     max_steps = int(cfg.get("max_steps", 0))
     her_ratio = float(cfg.get("her_ratio", 0.0))
+    update_every = int(cfg.get("update_every", 1))
+    updates_per_step = int(cfg.get("updates_per_step", 1))
     alpha_max = cfg.get("alpha_max")
     save_best = bool(cfg.get("save_best", True))
     best_auc = float("inf")
@@ -244,74 +275,75 @@ def train(cfg):
                 # Truncated episode: do not mark terminal for critic targets.
                 break
 
-            if replay.size > cfg["batch_start"]:
-                bs = min(cfg["batch_size"], replay.size)
-                batch_items, indices, weights = replay.sample(bs)
-                states = []
-                next_states = []
-                actions = []
-                rewards = []
-                dones = []
-                data_list = []
-                next_data_list = []
-                for s, a, r, s2, d, goal, prev_t, next_t, s_data, s2_data in batch_items:
-                    if her_ratio > 0 and np.random.rand() < her_ratio:
-                        achieved_goal = (1.0 - s2.action_mask).astype(np.float32)
-                        goal = achieved_goal
-                        r = env.compute_reward_with_goal(
-                            prev_t,
-                            next_t,
-                            goal,
-                            s2.action_mask,
-                            alpha=reward_alpha,
-                            beta=reward_beta,
-                            gamma=reward_gamma,
-                            mode=reward_mode,
-                            clip=reward_clip,
-                        ) * reward_scale
-                        d = float(env.is_goal_complete(goal, s2.action_mask))
-                        s = apply_goal(s, goal)
-                        s2 = apply_goal(s2, goal)
-                        s_data = state_to_data(s)
-                        s2_data = state_to_data(s2)
-                    states.append(s)
-                    next_states.append(s2)
-                    data_list.append(s_data)
-                    next_data_list.append(s2_data)
-                    actions.append(a)
-                    rewards.append(r)
-                    dones.append(d)
-                batch_state, action_mask = build_pyg_batch_from_data(
-                    data_list,
-                    [s.action_mask for s in states],
-                    device,
-                )
-                batch_next_state, next_action_mask = build_pyg_batch_from_data(
-                    next_data_list,
-                    [s.action_mask for s in next_states],
-                    device,
-                )
-                edge_batch = batch_state.batch[batch_state.edge_index[0]]
-                global_actions = []
-                for i, a in enumerate(actions):
-                    idxs = (edge_batch == i).nonzero(as_tuple=False).squeeze(-1)
-                    global_actions.append(int(idxs[a]))
-                batch = (
-                    batch_state.x,
-                    batch_state.edge_index,
-                    batch_state.edge_attr,
-                    action_mask,
-                    batch_state.batch,
-                    torch.tensor(global_actions, dtype=torch.long, device=device),
-                    torch.tensor(rewards, dtype=torch.float32, device=device),
-                    batch_next_state.x,
-                    batch_next_state.edge_attr,
-                    next_action_mask,
-                    batch_next_state.batch,
-                    torch.tensor(dones, dtype=torch.float32, device=device),
-                )
-                last_losses = agent.update(batch, weights=weights, alpha_max=alpha_max)
-                replay.update_priorities(indices, last_losses.get("td_errors", []))
+            if replay.size > cfg["batch_start"] and (steps % update_every == 0):
+                for _ in range(updates_per_step):
+                    bs = min(cfg["batch_size"], replay.size)
+                    batch_items, indices, weights = replay.sample(bs)
+                    states = []
+                    next_states = []
+                    actions = []
+                    rewards = []
+                    dones = []
+                    data_list = []
+                    next_data_list = []
+                    for s, a, r, s2, d, goal, prev_t, next_t, s_data, s2_data in batch_items:
+                        if her_ratio > 0 and np.random.rand() < her_ratio:
+                            achieved_goal = (1.0 - s2.action_mask).astype(np.float32)
+                            goal = achieved_goal
+                            r = env.compute_reward_with_goal(
+                                prev_t,
+                                next_t,
+                                goal,
+                                s2.action_mask,
+                                alpha=reward_alpha,
+                                beta=reward_beta,
+                                gamma=reward_gamma,
+                                mode=reward_mode,
+                                clip=reward_clip,
+                            ) * reward_scale
+                            d = float(env.is_goal_complete(goal, s2.action_mask))
+                            s = apply_goal(s, goal)
+                            s2 = apply_goal(s2, goal)
+                            s_data = state_to_data(s)
+                            s2_data = state_to_data(s2)
+                        states.append(s)
+                        next_states.append(s2)
+                        data_list.append(s_data)
+                        next_data_list.append(s2_data)
+                        actions.append(a)
+                        rewards.append(r)
+                        dones.append(d)
+                    batch_state, action_mask = build_pyg_batch_from_data(
+                        data_list,
+                        [s.action_mask for s in states],
+                        device,
+                    )
+                    batch_next_state, next_action_mask = build_pyg_batch_from_data(
+                        next_data_list,
+                        [s.action_mask for s in next_states],
+                        device,
+                    )
+                    edge_batch = batch_state.batch[batch_state.edge_index[0]]
+                    global_actions = []
+                    for i, a in enumerate(actions):
+                        idxs = (edge_batch == i).nonzero(as_tuple=False).squeeze(-1)
+                        global_actions.append(int(idxs[a]))
+                    batch = (
+                        batch_state.x,
+                        batch_state.edge_index,
+                        batch_state.edge_attr,
+                        action_mask,
+                        batch_state.batch,
+                        torch.tensor(global_actions, dtype=torch.long, device=device),
+                        torch.tensor(rewards, dtype=torch.float32, device=device),
+                        batch_next_state.x,
+                        batch_next_state.edge_attr,
+                        next_action_mask,
+                        batch_next_state.batch,
+                        torch.tensor(dones, dtype=torch.float32, device=device),
+                    )
+                    last_losses = agent.update(batch, weights=weights, alpha_max=alpha_max)
+                    replay.update_priorities(indices, last_losses.get("td_errors", []))
 
         tstt_mean = float(np.mean(episode_tstt)) if episode_tstt else env.tstt
         tstt_auc = float(np.trapezoid(episode_tstt)) if episode_tstt else env.tstt

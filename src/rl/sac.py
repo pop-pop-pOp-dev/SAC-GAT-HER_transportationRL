@@ -198,7 +198,7 @@ class DiscreteSAC:
 
         if self.target_entropy is None:
             valid = scatter_sum((action_mask > 0).float(), edge_batch, dim=0)
-            target_entropy = (-0.6 * torch.log(valid + 1e-8)).mean()
+            target_entropy = (0.6 * torch.log(valid + 1e-8)).mean()
         else:
             target_entropy = self.target_entropy
         log_probs = torch.log(probs + 1e-8).detach()

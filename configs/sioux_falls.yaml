@@ -12,6 +12,8 @@ use_cugraph: true
 episodes: 5000
 buffer_size: 1000000
 batch_start: 500
+update_every: 4
+updates_per_step: 1
 batch_size: 512
 per_alpha: 0.6
 per_beta: 0.4
