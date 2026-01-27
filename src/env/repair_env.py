@@ -292,8 +292,9 @@ class RepairEnv:
                 if self.is_damaged[i] == 1.0:
                     t[i] = 1e6
                     continue
-                vc = max(flow[i] / max(self.capacities[i], 1e-6), 0.0)
-                t[i] = self.t0[i] * (1.0 + self.bpr_alpha * (vc ** self.bpr_beta))
+            vc = max(flow[i] / max(self.capacities[i], 1e-6), 0.0)
+            vc = min(vc, 4.0)
+            t[i] = self.t0[i] * (1.0 + self.bpr_alpha * (vc ** self.bpr_beta))
             return t
 
         import torch
@@ -302,19 +303,21 @@ class RepairEnv:
         cap_t = torch.tensor(self.capacities, dtype=torch.float32, device=self.device)
         t0_t = torch.tensor(self.t0, dtype=torch.float32, device=self.device)
         damaged_t = torch.tensor(self.is_damaged, dtype=torch.float32, device=self.device)
-        vc = torch.clamp(flow_t / torch.clamp(cap_t, min=1e-6), min=0.0)
+        vc = torch.clamp(flow_t / torch.clamp(cap_t, min=1e-6), min=0.0, max=4.0)
         t = t0_t * (1.0 + self.bpr_alpha * (vc ** self.bpr_beta))
         t = torch.where(damaged_t > 0, torch.full_like(t, 1e6), t)
         return t.detach().cpu().numpy()
 
     def compute_tstt(self, flow: np.ndarray, t: np.ndarray, unassigned_demand: float = 0.0) -> float:
         base = float(np.sum(flow * t))
+        total_demand = max(self.total_demand, 1.0)
+        att_base = base / total_demand
         if unassigned_demand > 0:
-            frac = float(unassigned_demand) / max(self.total_demand, 1.0)
+            frac = float(unassigned_demand) / total_demand
             penalty = float(self.unassigned_penalty) * frac
         else:
             penalty = 0.0
-        return base + penalty
+        return att_base + penalty
 
     def shortest_path_edges(self, origin: int, dest: int, t: np.ndarray) -> List[int]:
         for (u, v, data) in self.nx_graph.edges(data=True):
@@ -352,7 +355,7 @@ class RepairEnv:
             raw_vc[i] = self.flow[i] / max(self.capacities[i], 1e-6)
         vc = np.where(self.is_damaged > 0, 0.0, raw_vc)
         vc = np.log1p(vc)
-        vc = np.clip(vc, 0.0, 5.0)
+        vc = np.clip(vc, 0.0, 10.0)
 
         goal_total = float(np.sum(self.goal_mask))
         remaining = float(np.sum(self.goal_mask * self.is_damaged))
@@ -372,10 +375,12 @@ class RepairEnv:
 
         edge_id_norm = np.arange(self.num_edges, dtype=np.float32) / max(self.num_edges - 1, 1)
 
+        t0_norm = np.log10(self.t0 + 1.0) / np.log10(self.max_t0 + 1.0)
+        cap_norm = np.log10(self.capacities + 1.0) / np.log10(self.max_capacity + 1.0)
         edge_features = np.stack(
             [
-                (self.t0.astype(np.float32) / max(self.max_t0, 1e-6)),
-                (self.capacities.astype(np.float32) / max(self.max_capacity, 1e-6)),
+                t0_norm.astype(np.float32),
+                cap_norm.astype(np.float32),
                 vc,
                 self.is_damaged,
                 self.goal_mask,
