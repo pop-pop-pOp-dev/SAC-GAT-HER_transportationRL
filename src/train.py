@@ -3,6 +3,9 @@ from __future__ import annotations
 import argparse
 import os
 import random
+import time
+import multiprocessing as mp
+import queue
 from dataclasses import dataclass
 from typing import List, Tuple
 
@@ -17,7 +20,7 @@ from torch_geometric.data import Data, Batch
 from src.data.tntp_download import download_sioux_falls
 from src.data.tntp_parser import load_graph_data
 from src.env.repair_env import RepairEnv, EnvState
-from src.rl.sac import DiscreteSAC
+from src.rl.sac import DiscreteSAC, Actor
 
 
 @dataclass
@@ -131,6 +134,80 @@ def apply_goal(state: EnvState, goal: np.ndarray) -> EnvState:
     )
 
 
+def rollout_worker(worker_id, cfg, weights_queue, out_queue, stop_event):
+    device = torch.device("cpu")
+    data_paths = download_sioux_falls(cfg["data_dir"])
+    graph = load_graph_data(data_paths["net_path"], data_paths["trips_path"])
+    env = RepairEnv(
+        graph,
+        damaged_ratio=cfg["damaged_ratio"],
+        assignment_iters=cfg["assignment_iters"],
+        assignment_method=cfg.get("assignment_method", "msa"),
+        use_cugraph=cfg.get("use_cugraph", False),
+        use_torch=cfg.get("use_torch_bpr", False),
+        device=str(device),
+        reward_mode=cfg.get("reward_mode", "delta"),
+        reward_alpha=cfg.get("reward_alpha", 1.0),
+        reward_beta=cfg.get("reward_beta", 10.0),
+        reward_gamma=cfg.get("reward_gamma", 0.1),
+        reward_clip=cfg.get("reward_clip", 0.0),
+        capacity_damage=cfg.get("capacity_damage", 1e-3),
+        unassigned_penalty=cfg.get("unassigned_penalty", 2e7),
+        debug_reward=False,
+        seed=cfg["seed"] + 1000 + worker_id,
+    )
+    reward_scale = float(cfg.get("reward_scale", 1.0))
+    rollout_steps = int(cfg.get("rollout_steps_per_worker", 5))
+    state = env.reset(damaged_ratio=cfg["damaged_ratio"])
+    actor = Actor(
+        node_in=state.node_features.shape[1],
+        edge_in=state.edge_features.shape[1],
+        hidden=cfg["hidden_dim"],
+        embed=cfg["embed_dim"],
+        num_layers=cfg.get("gat_layers", 3),
+    ).to(device)
+    actor.eval()
+
+    while not stop_event.is_set():
+        # Refresh weights if provided.
+        try:
+            while True:
+                weights = weights_queue.get_nowait()
+                actor.load_state_dict(weights)
+        except queue.Empty:
+            pass
+
+        for _ in range(rollout_steps):
+            if stop_event.is_set():
+                break
+            node_x, edge_index, edge_attr, action_mask = to_torch(state, device)
+            batch = torch.zeros(node_x.size(0), dtype=torch.long, device=device)
+            with torch.no_grad():
+                logits, probs, _ = actor(node_x, edge_index, edge_attr, action_mask, batch)
+                action = torch.multinomial(probs, 1).item()
+            prev_tstt = env.tstt
+            next_state, reward, done, info = env.step(action)
+            next_tstt = info.get("tstt", env.tstt)
+            scaled_reward = reward * reward_scale
+            out_queue.put(
+                {
+                    "type": "step",
+                    "worker": worker_id,
+                    "state": state,
+                    "action": action,
+                    "reward": scaled_reward,
+                    "next_state": next_state,
+                    "done": float(done),
+                    "prev_tstt": prev_tstt,
+                    "next_tstt": next_tstt,
+                }
+            )
+            state = next_state
+            if done:
+                state = env.reset(damaged_ratio=cfg["damaged_ratio"])
+                out_queue.put({"type": "episode_done", "worker": worker_id})
+                break
+
 def train(cfg):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     seed_override = os.environ.get("SEED_OVERRIDE")
@@ -160,9 +237,13 @@ def train(cfg):
         seed=cfg["seed"],
     )
 
+    sample_state = env.get_state()
+    node_in = sample_state.node_features.shape[1]
+    edge_in = sample_state.edge_features.shape[1]
+
     agent = DiscreteSAC(
-        node_in=3,
-        edge_in=6,
+        node_in=node_in,
+        edge_in=edge_in,
         hidden=cfg["hidden_dim"],
         embed=cfg["embed_dim"],
         num_layers=cfg.get("gat_layers", 3),
@@ -236,122 +317,16 @@ def train(cfg):
         smoothed = np.divide(numer, np.maximum(denom, 1.0))
         smoothed[denom == 0] = np.nan
         return smoothed
-    for episode in tqdm(range(cfg["episodes"])):
-        state = env.reset(damaged_ratio=cfg["damaged_ratio"])
-        done = False
-        episode_reward = 0.0
-        steps = 0
-        episode_tstt = []
-        last_losses = {}
-        while not done:
-            node_x, edge_index, edge_attr, action_mask = to_torch(state, device)
-            out = agent.select_action(node_x, edge_index, edge_attr, action_mask, deterministic=False)
-            prev_tstt = env.tstt
-            next_state, reward, done, info = env.step(out.action)
-            next_tstt = info.get("tstt", env.tstt)
-            delta_tstt = prev_tstt - next_tstt
-            episode_tstt.append(next_tstt)
-            scaled_reward = reward * reward_scale
-            state_data = state_to_data(state)
-            next_state_data = state_to_data(next_state)
-            replay.add(
-                (
-                    state,
-                    out.action,
-                    scaled_reward,
-                    next_state,
-                    float(done),
-                    state.goal_mask,
-                    prev_tstt,
-                    next_tstt,
-                    state_data,
-                    next_state_data,
-                )
-            )
-            state = next_state
-            episode_reward += scaled_reward
-            steps += 1
-            if max_steps > 0 and steps >= max_steps and not done:
-                # Truncated episode: do not mark terminal for critic targets.
-                break
 
-            if replay.size > cfg["batch_start"] and (steps % update_every == 0):
-                for _ in range(updates_per_step):
-                    bs = min(cfg["batch_size"], replay.size)
-                    batch_items, indices, weights = replay.sample(bs)
-                    states = []
-                    next_states = []
-                    actions = []
-                    rewards = []
-                    dones = []
-                    data_list = []
-                    next_data_list = []
-                    for s, a, r, s2, d, goal, prev_t, next_t, s_data, s2_data in batch_items:
-                        if her_ratio > 0 and np.random.rand() < her_ratio:
-                            achieved_goal = (1.0 - s2.action_mask).astype(np.float32)
-                            goal = achieved_goal
-                            r = env.compute_reward_with_goal(
-                                prev_t,
-                                next_t,
-                                goal,
-                                s2.action_mask,
-                                alpha=reward_alpha,
-                                beta=reward_beta,
-                                gamma=reward_gamma,
-                                mode=reward_mode,
-                                clip=reward_clip,
-                            ) * reward_scale
-                            d = float(env.is_goal_complete(goal, s2.action_mask))
-                            s = apply_goal(s, goal)
-                            s2 = apply_goal(s2, goal)
-                            s_data = state_to_data(s)
-                            s2_data = state_to_data(s2)
-                        states.append(s)
-                        next_states.append(s2)
-                        data_list.append(s_data)
-                        next_data_list.append(s2_data)
-                        actions.append(a)
-                        rewards.append(r)
-                        dones.append(d)
-                    batch_state, action_mask = build_pyg_batch_from_data(
-                        data_list,
-                        [s.action_mask for s in states],
-                        device,
-                    )
-                    batch_next_state, next_action_mask = build_pyg_batch_from_data(
-                        next_data_list,
-                        [s.action_mask for s in next_states],
-                        device,
-                    )
-                    edge_batch = batch_state.batch[batch_state.edge_index[0]]
-                    global_actions = []
-                    for i, a in enumerate(actions):
-                        idxs = (edge_batch == i).nonzero(as_tuple=False).squeeze(-1)
-                        global_actions.append(int(idxs[a]))
-                    batch = (
-                        batch_state.x,
-                        batch_state.edge_index,
-                        batch_state.edge_attr,
-                        action_mask,
-                        batch_state.batch,
-                        torch.tensor(global_actions, dtype=torch.long, device=device),
-                        torch.tensor(rewards, dtype=torch.float32, device=device),
-                        batch_next_state.x,
-                        batch_next_state.edge_attr,
-                        next_action_mask,
-                        batch_next_state.batch,
-                        torch.tensor(dones, dtype=torch.float32, device=device),
-                    )
-                    last_losses = agent.update(batch, weights=weights, alpha_max=alpha_max)
-                    replay.update_priorities(indices, last_losses.get("td_errors", []))
-
-        tstt_mean = float(np.mean(episode_tstt)) if episode_tstt else env.tstt
-        tstt_auc = float(np.trapezoid(episode_tstt)) if episode_tstt else env.tstt
+    def record_episode(episode_idx, episode_reward, episode_tstt, last_losses, last_tstt, delta_tstt):
+        nonlocal best_auc
+        tstt_mean = float(np.mean(episode_tstt)) if episode_tstt else last_tstt
+        tstt_auc = float(np.trapezoid(episode_tstt)) if episode_tstt else last_tstt
         metrics.append(
             {
-                "episode": episode,
+                "episode": episode_idx,
                 "reward": episode_reward,
-                "tstt_last": env.tstt,
+                "tstt_last": last_tstt,
                 "tstt_mean": tstt_mean,
                 "tstt_auc": tstt_auc,
             }
@@ -360,7 +335,7 @@ def train(cfg):
             best_auc = tstt_auc
             best_path = os.path.join(model_dir, "model_best.pt")
             agent.save(best_path)
-        writer.add_scalar("train/delta_tstt", delta_tstt, episode)
+        writer.add_scalar("train/delta_tstt", delta_tstt, episode_idx)
         reward_hist.append(episode_reward)
         tstt_mean_hist.append(tstt_mean)
         tstt_auc_hist.append(tstt_auc)
@@ -368,21 +343,21 @@ def train(cfg):
         actor_hist.append(last_losses.get("actor_loss") if last_losses else None)
         alpha_loss_hist.append(last_losses.get("alpha_loss") if last_losses else None)
         entropy_hist.append(last_losses.get("policy_entropy") if last_losses else None)
-        writer.add_scalar("train/reward", episode_reward, episode)
-        writer.add_scalar("train/tstt_mean", tstt_mean, episode)
-        writer.add_scalar("train/tstt_auc", tstt_auc, episode)
+        writer.add_scalar("train/reward", episode_reward, episode_idx)
+        writer.add_scalar("train/tstt_mean", tstt_mean, episode_idx)
+        writer.add_scalar("train/tstt_auc", tstt_auc, episode_idx)
         if last_losses:
-            writer.add_scalar("train/critic_loss", last_losses.get("critic_loss", 0.0), episode)
-            writer.add_scalar("train/actor_loss", last_losses.get("actor_loss", 0.0), episode)
-            writer.add_scalar("train/alpha", last_losses.get("alpha", 0.0), episode)
-            writer.add_scalar("train/alpha_loss", last_losses.get("alpha_loss", 0.0), episode)
-            writer.add_scalar("train/policy_entropy", last_losses.get("policy_entropy", 0.0), episode)
-        if plot_every > 0 and (episode + 1) % plot_every == 0:
+            writer.add_scalar("train/critic_loss", last_losses.get("critic_loss", 0.0), episode_idx)
+            writer.add_scalar("train/actor_loss", last_losses.get("actor_loss", 0.0), episode_idx)
+            writer.add_scalar("train/alpha", last_losses.get("alpha", 0.0), episode_idx)
+            writer.add_scalar("train/alpha_loss", last_losses.get("alpha_loss", 0.0), episode_idx)
+            writer.add_scalar("train/policy_entropy", last_losses.get("policy_entropy", 0.0), episode_idx)
+        if plot_every > 0 and (episode_idx + 1) % plot_every == 0:
             fig, axes = plt.subplots(4, 2, figsize=(12, 16), sharex=True)
             x = np.arange(len(reward_hist))
             reward_smooth = smooth_series(reward_hist, smooth_window)
             axes[0, 0].plot(x, reward_hist, color="#1f77b4", label="Reward")
-            axes[0, 0].plot(x, reward_smooth, color="#1f9bff", linestyle="--", label="Reward (smoothed)")
+            axes[0, 0].plot(x, reward_smooth, color="#00e5ff", linestyle="--", label="Reward (smoothed)")
             axes[0, 0].set_title("Reward")
             axes[0, 0].set_xlabel("Episode")
             axes[0, 0].set_ylabel("Scaled Reward")
@@ -390,7 +365,7 @@ def train(cfg):
 
             tstt_mean_smooth = smooth_series(tstt_mean_hist, smooth_window)
             axes[0, 1].plot(x, tstt_mean_hist, color="#2ca02c", label="TSTT Mean")
-            axes[0, 1].plot(x, tstt_mean_smooth, color="#3bd23b", linestyle="--", label="TSTT Mean (smoothed)")
+            axes[0, 1].plot(x, tstt_mean_smooth, color="#00ff4f", linestyle="--", label="TSTT Mean (smoothed)")
             axes[0, 1].set_title("TSTT Mean")
             axes[0, 1].set_xlabel("Episode")
             axes[0, 1].set_ylabel("TSTT")
@@ -398,7 +373,7 @@ def train(cfg):
 
             tstt_auc_smooth = smooth_series(tstt_auc_hist, smooth_window)
             axes[1, 0].plot(x, tstt_auc_hist, color="#9467bd", label="TSTT AUC")
-            axes[1, 0].plot(x, tstt_auc_smooth, color="#b27cf2", linestyle="--", label="TSTT AUC (smoothed)")
+            axes[1, 0].plot(x, tstt_auc_smooth, color="#ff00ff", linestyle="--", label="TSTT AUC (smoothed)")
             axes[1, 0].set_title("TSTT AUC")
             axes[1, 0].set_xlabel("Episode")
             axes[1, 0].set_ylabel("AUC")
@@ -407,7 +382,7 @@ def train(cfg):
             critic_vals = [v if v is not None else np.nan for v in critic_hist]
             critic_smooth = smooth_series(critic_vals, smooth_window)
             axes[1, 1].plot(x, critic_vals, color="#d62728", label="Critic Loss")
-            axes[1, 1].plot(x, critic_smooth, color="#ff3b3b", linestyle="--", label="Critic Loss (smoothed)")
+            axes[1, 1].plot(x, critic_smooth, color="#ff004c", linestyle="--", label="Critic Loss (smoothed)")
             axes[1, 1].set_title("Critic Loss")
             axes[1, 1].set_xlabel("Episode")
             axes[1, 1].set_ylabel("Loss")
@@ -416,7 +391,7 @@ def train(cfg):
             actor_vals = [v if v is not None else np.nan for v in actor_hist]
             actor_smooth = smooth_series(actor_vals, smooth_window)
             axes[2, 0].plot(x, actor_vals, color="#ff7f0e", label="Actor Loss")
-            axes[2, 0].plot(x, actor_smooth, color="#ff9f2e", linestyle="--", label="Actor Loss (smoothed)")
+            axes[2, 0].plot(x, actor_smooth, color="#ff8c00", linestyle="--", label="Actor Loss (smoothed)")
             axes[2, 0].set_title("Actor Loss")
             axes[2, 0].set_xlabel("Episode")
             axes[2, 0].set_ylabel("Loss")
@@ -425,7 +400,7 @@ def train(cfg):
             tstt_last_vals = [m["tstt_last"] for m in metrics]
             tstt_last_smooth = smooth_series(tstt_last_vals, smooth_window)
             axes[2, 1].plot(x, tstt_last_vals, color="#8c564b", label="TSTT Last")
-            axes[2, 1].plot(x, tstt_last_smooth, color="#b06f61", linestyle="--", label="TSTT Last (smoothed)")
+            axes[2, 1].plot(x, tstt_last_smooth, color="#ff00a8", linestyle="--", label="TSTT Last (smoothed)")
             axes[2, 1].set_title("TSTT Last (Episode End)")
             axes[2, 1].set_xlabel("Episode")
             axes[2, 1].set_ylabel("TSTT")
@@ -434,7 +409,7 @@ def train(cfg):
             alpha_loss_vals = [v if v is not None else np.nan for v in alpha_loss_hist]
             alpha_loss_smooth = smooth_series(alpha_loss_vals, smooth_window)
             axes[3, 0].plot(x, alpha_loss_vals, color="#17becf", label="Alpha Loss")
-            axes[3, 0].plot(x, alpha_loss_smooth, color="#3fe1f5", linestyle="--", label="Alpha Loss (smoothed)")
+            axes[3, 0].plot(x, alpha_loss_smooth, color="#00f5ff", linestyle="--", label="Alpha Loss (smoothed)")
             axes[3, 0].set_title("Alpha Loss")
             axes[3, 0].set_xlabel("Episode")
             axes[3, 0].set_ylabel("Loss")
@@ -443,7 +418,7 @@ def train(cfg):
             entropy_vals = [v if v is not None else np.nan for v in entropy_hist]
             entropy_smooth = smooth_series(entropy_vals, smooth_window)
             axes[3, 1].plot(x, entropy_vals, color="#7f7f7f", label="Policy Entropy")
-            axes[3, 1].plot(x, entropy_smooth, color="#b3b3b3", linestyle="--", label="Policy Entropy (smoothed)")
+            axes[3, 1].plot(x, entropy_smooth, color="#b6ff00", linestyle="--", label="Policy Entropy (smoothed)")
             axes[3, 1].set_title("Policy Entropy")
             axes[3, 1].set_xlabel("Episode")
             axes[3, 1].set_ylabel("Entropy")
@@ -454,6 +429,276 @@ def train(cfg):
             fig.tight_layout()
             fig.savefig(fig_path, dpi=200)
             plt.close(fig)
+    num_workers = int(cfg.get("num_workers", 0))
+    if num_workers > 0:
+        ctx = mp.get_context("spawn")
+        queue_size = int(cfg.get("queue_size", 10000))
+        weights_sync_every = int(cfg.get("weights_sync_every", 200))
+        out_queue = ctx.Queue(maxsize=queue_size)
+        stop_event = ctx.Event()
+        weights_queues = []
+        workers = []
+        for i in range(num_workers):
+            wq = ctx.Queue(maxsize=1)
+            wq.put(agent.actor.state_dict())
+            p = ctx.Process(target=rollout_worker, args=(i, cfg, wq, out_queue, stop_event))
+            p.daemon = True
+            p.start()
+            weights_queues.append(wq)
+            workers.append(p)
+
+        worker_rewards = [0.0 for _ in range(num_workers)]
+        worker_tstt = [[] for _ in range(num_workers)]
+        worker_last_delta = [0.0 for _ in range(num_workers)]
+        episodes_done = 0
+        global_steps = 0
+        last_losses = {}
+
+        while episodes_done < cfg["episodes"]:
+            try:
+                msg = out_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+
+            if msg.get("type") == "step":
+                wid = msg["worker"]
+                state = msg["state"]
+                next_state = msg["next_state"]
+                prev_tstt = msg["prev_tstt"]
+                next_tstt = msg["next_tstt"]
+                delta_tstt = prev_tstt - next_tstt
+                worker_last_delta[wid] = delta_tstt
+                worker_rewards[wid] += msg["reward"]
+                worker_tstt[wid].append(next_tstt)
+
+                state_data = state_to_data(state)
+                next_state_data = state_to_data(next_state)
+                replay.add(
+                    (
+                        state,
+                        msg["action"],
+                        msg["reward"],
+                        next_state,
+                        msg["done"],
+                        state.goal_mask,
+                        prev_tstt,
+                        next_tstt,
+                        state_data,
+                        next_state_data,
+                    )
+                )
+                global_steps += 1
+
+                if replay.size > cfg["batch_start"] and (global_steps % update_every == 0):
+                    for _ in range(updates_per_step):
+                        bs = min(cfg["batch_size"], replay.size)
+                        batch_items, indices, weights = replay.sample(bs)
+                        states = []
+                        next_states = []
+                        actions = []
+                        rewards = []
+                        dones = []
+                        data_list = []
+                        next_data_list = []
+                        for s, a, r, s2, d, goal, prev_t, next_t, s_data, s2_data in batch_items:
+                            if her_ratio > 0 and np.random.rand() < her_ratio:
+                                achieved_goal = (1.0 - s2.action_mask).astype(np.float32)
+                                goal = achieved_goal
+                                r = env.compute_reward_with_goal(
+                                    prev_t,
+                                    next_t,
+                                    goal,
+                                    s2.action_mask,
+                                    alpha=reward_alpha,
+                                    beta=reward_beta,
+                                    gamma=reward_gamma,
+                                    mode=reward_mode,
+                                    clip=reward_clip,
+                                ) * reward_scale
+                                d = float(env.is_goal_complete(goal, s2.action_mask))
+                                s = apply_goal(s, goal)
+                                s2 = apply_goal(s2, goal)
+                                s_data = state_to_data(s)
+                                s2_data = state_to_data(s2)
+                            states.append(s)
+                            next_states.append(s2)
+                            data_list.append(s_data)
+                            next_data_list.append(s2_data)
+                            actions.append(a)
+                            rewards.append(r)
+                            dones.append(d)
+                        batch_state, action_mask = build_pyg_batch_from_data(
+                            data_list,
+                            [s.action_mask for s in states],
+                            device,
+                        )
+                        batch_next_state, next_action_mask = build_pyg_batch_from_data(
+                            next_data_list,
+                            [s.action_mask for s in next_states],
+                            device,
+                        )
+                        edge_batch = batch_state.batch[batch_state.edge_index[0]]
+                        global_actions = []
+                        for i, a in enumerate(actions):
+                            idxs = (edge_batch == i).nonzero(as_tuple=False).squeeze(-1)
+                            global_actions.append(int(idxs[a]))
+                        batch = (
+                            batch_state.x,
+                            batch_state.edge_index,
+                            batch_state.edge_attr,
+                            action_mask,
+                            batch_state.batch,
+                            torch.tensor(global_actions, dtype=torch.long, device=device),
+                            torch.tensor(rewards, dtype=torch.float32, device=device),
+                            batch_next_state.x,
+                            batch_next_state.edge_attr,
+                            next_action_mask,
+                            batch_next_state.batch,
+                            torch.tensor(dones, dtype=torch.float32, device=device),
+                        )
+                        last_losses = agent.update(batch, weights=weights, alpha_max=alpha_max)
+                        replay.update_priorities(indices, last_losses.get("td_errors", []))
+
+                if weights_sync_every > 0 and (global_steps % weights_sync_every == 0):
+                    weights = agent.actor.state_dict()
+                    for wq in weights_queues:
+                        try:
+                            while True:
+                                wq.get_nowait()
+                        except queue.Empty:
+                            pass
+                        try:
+                            wq.put_nowait(weights)
+                        except queue.Full:
+                            pass
+
+                if msg["done"]:
+                    record_episode(
+                        episodes_done,
+                        worker_rewards[wid],
+                        worker_tstt[wid],
+                        last_losses,
+                        next_tstt,
+                        worker_last_delta[wid],
+                    )
+                    worker_rewards[wid] = 0.0
+                    worker_tstt[wid] = []
+                    episodes_done += 1
+
+        stop_event.set()
+        for p in workers:
+            p.join(timeout=2.0)
+    else:
+        for episode in tqdm(range(cfg["episodes"])):
+            state = env.reset(damaged_ratio=cfg["damaged_ratio"])
+            done = False
+            episode_reward = 0.0
+            steps = 0
+            episode_tstt = []
+            last_losses = {}
+            while not done:
+                node_x, edge_index, edge_attr, action_mask = to_torch(state, device)
+                out = agent.select_action(node_x, edge_index, edge_attr, action_mask, deterministic=False)
+                prev_tstt = env.tstt
+                next_state, reward, done, info = env.step(out.action)
+                next_tstt = info.get("tstt", env.tstt)
+                delta_tstt = prev_tstt - next_tstt
+                episode_tstt.append(next_tstt)
+                scaled_reward = reward * reward_scale
+                state_data = state_to_data(state)
+                next_state_data = state_to_data(next_state)
+                replay.add(
+                    (
+                        state,
+                        out.action,
+                        scaled_reward,
+                        next_state,
+                        float(done),
+                        state.goal_mask,
+                        prev_tstt,
+                        next_tstt,
+                        state_data,
+                        next_state_data,
+                    )
+                )
+                state = next_state
+                episode_reward += scaled_reward
+                steps += 1
+                if max_steps > 0 and steps >= max_steps and not done:
+                    # Truncated episode: do not mark terminal for critic targets.
+                    break
+
+                if replay.size > cfg["batch_start"] and (steps % update_every == 0):
+                    for _ in range(updates_per_step):
+                        bs = min(cfg["batch_size"], replay.size)
+                        batch_items, indices, weights = replay.sample(bs)
+                        states = []
+                        next_states = []
+                        actions = []
+                        rewards = []
+                        dones = []
+                        data_list = []
+                        next_data_list = []
+                        for s, a, r, s2, d, goal, prev_t, next_t, s_data, s2_data in batch_items:
+                            if her_ratio > 0 and np.random.rand() < her_ratio:
+                                achieved_goal = (1.0 - s2.action_mask).astype(np.float32)
+                                goal = achieved_goal
+                                r = env.compute_reward_with_goal(
+                                    prev_t,
+                                    next_t,
+                                    goal,
+                                    s2.action_mask,
+                                    alpha=reward_alpha,
+                                    beta=reward_beta,
+                                    gamma=reward_gamma,
+                                    mode=reward_mode,
+                                    clip=reward_clip,
+                                ) * reward_scale
+                                d = float(env.is_goal_complete(goal, s2.action_mask))
+                                s = apply_goal(s, goal)
+                                s2 = apply_goal(s2, goal)
+                                s_data = state_to_data(s)
+                                s2_data = state_to_data(s2)
+                            states.append(s)
+                            next_states.append(s2)
+                            data_list.append(s_data)
+                            next_data_list.append(s2_data)
+                            actions.append(a)
+                            rewards.append(r)
+                            dones.append(d)
+                        batch_state, action_mask = build_pyg_batch_from_data(
+                            data_list,
+                            [s.action_mask for s in states],
+                            device,
+                        )
+                        batch_next_state, next_action_mask = build_pyg_batch_from_data(
+                            next_data_list,
+                            [s.action_mask for s in next_states],
+                            device,
+                        )
+                        edge_batch = batch_state.batch[batch_state.edge_index[0]]
+                        global_actions = []
+                        for i, a in enumerate(actions):
+                            idxs = (edge_batch == i).nonzero(as_tuple=False).squeeze(-1)
+                            global_actions.append(int(idxs[a]))
+                        batch = (
+                            batch_state.x,
+                            batch_state.edge_index,
+                            batch_state.edge_attr,
+                            action_mask,
+                            batch_state.batch,
+                            torch.tensor(global_actions, dtype=torch.long, device=device),
+                            torch.tensor(rewards, dtype=torch.float32, device=device),
+                            batch_next_state.x,
+                            batch_next_state.edge_attr,
+                            next_action_mask,
+                            batch_next_state.batch,
+                            torch.tensor(dones, dtype=torch.float32, device=device),
+                        )
+                        last_losses = agent.update(batch, weights=weights, alpha_max=alpha_max)
+                        replay.update_priorities(indices, last_losses.get("td_errors", []))
+
+            record_episode(episode, episode_reward, episode_tstt, last_losses, env.tstt, delta_tstt)
 
     out_path = os.path.join(cfg["output_dir"], "train_metrics.npy")
     np.save(out_path, metrics)
@@ -462,7 +707,7 @@ def train(cfg):
         x = np.arange(len(reward_hist))
         reward_smooth = smooth_series(reward_hist, smooth_window)
         axes[0, 0].plot(x, reward_hist, color="#1f77b4", label="Reward")
-        axes[0, 0].plot(x, reward_smooth, color="#1f9bff", linestyle="--", label="Reward (smoothed)")
+        axes[0, 0].plot(x, reward_smooth, color="#00e5ff", linestyle="--", label="Reward (smoothed)")
         axes[0, 0].set_title("Reward")
         axes[0, 0].set_xlabel("Episode")
         axes[0, 0].set_ylabel("Scaled Reward")
@@ -470,7 +715,7 @@ def train(cfg):
 
         tstt_mean_smooth = smooth_series(tstt_mean_hist, smooth_window)
         axes[0, 1].plot(x, tstt_mean_hist, color="#2ca02c", label="TSTT Mean")
-        axes[0, 1].plot(x, tstt_mean_smooth, color="#3bd23b", linestyle="--", label="TSTT Mean (smoothed)")
+        axes[0, 1].plot(x, tstt_mean_smooth, color="#00ff4f", linestyle="--", label="TSTT Mean (smoothed)")
         axes[0, 1].set_title("TSTT Mean")
         axes[0, 1].set_xlabel("Episode")
         axes[0, 1].set_ylabel("TSTT")
@@ -478,7 +723,7 @@ def train(cfg):
 
         tstt_auc_smooth = smooth_series(tstt_auc_hist, smooth_window)
         axes[1, 0].plot(x, tstt_auc_hist, color="#9467bd", label="TSTT AUC")
-        axes[1, 0].plot(x, tstt_auc_smooth, color="#b27cf2", linestyle="--", label="TSTT AUC (smoothed)")
+        axes[1, 0].plot(x, tstt_auc_smooth, color="#ff00ff", linestyle="--", label="TSTT AUC (smoothed)")
         axes[1, 0].set_title("TSTT AUC")
         axes[1, 0].set_xlabel("Episode")
         axes[1, 0].set_ylabel("AUC")
@@ -487,7 +732,7 @@ def train(cfg):
         critic_vals = [v if v is not None else np.nan for v in critic_hist]
         critic_smooth = smooth_series(critic_vals, smooth_window)
         axes[1, 1].plot(x, critic_vals, color="#d62728", label="Critic Loss")
-        axes[1, 1].plot(x, critic_smooth, color="#ff3b3b", linestyle="--", label="Critic Loss (smoothed)")
+        axes[1, 1].plot(x, critic_smooth, color="#ff004c", linestyle="--", label="Critic Loss (smoothed)")
         axes[1, 1].set_title("Critic Loss")
         axes[1, 1].set_xlabel("Episode")
         axes[1, 1].set_ylabel("Loss")
@@ -496,7 +741,7 @@ def train(cfg):
         actor_vals = [v if v is not None else np.nan for v in actor_hist]
         actor_smooth = smooth_series(actor_vals, smooth_window)
         axes[2, 0].plot(x, actor_vals, color="#ff7f0e", label="Actor Loss")
-        axes[2, 0].plot(x, actor_smooth, color="#ff9f2e", linestyle="--", label="Actor Loss (smoothed)")
+        axes[2, 0].plot(x, actor_smooth, color="#ff8c00", linestyle="--", label="Actor Loss (smoothed)")
         axes[2, 0].set_title("Actor Loss")
         axes[2, 0].set_xlabel("Episode")
         axes[2, 0].set_ylabel("Loss")
@@ -505,7 +750,7 @@ def train(cfg):
         tstt_last_vals = [m["tstt_last"] for m in metrics]
         tstt_last_smooth = smooth_series(tstt_last_vals, smooth_window)
         axes[2, 1].plot(x, tstt_last_vals, color="#8c564b", label="TSTT Last")
-        axes[2, 1].plot(x, tstt_last_smooth, color="#b06f61", linestyle="--", label="TSTT Last (smoothed)")
+        axes[2, 1].plot(x, tstt_last_smooth, color="#ff00a8", linestyle="--", label="TSTT Last (smoothed)")
         axes[2, 1].set_title("TSTT Last (Episode End)")
         axes[2, 1].set_xlabel("Episode")
         axes[2, 1].set_ylabel("TSTT")
@@ -514,7 +759,7 @@ def train(cfg):
         alpha_loss_vals = [v if v is not None else np.nan for v in alpha_loss_hist]
         alpha_loss_smooth = smooth_series(alpha_loss_vals, smooth_window)
         axes[3, 0].plot(x, alpha_loss_vals, color="#17becf", label="Alpha Loss")
-        axes[3, 0].plot(x, alpha_loss_smooth, color="#3fe1f5", linestyle="--", label="Alpha Loss (smoothed)")
+        axes[3, 0].plot(x, alpha_loss_smooth, color="#00f5ff", linestyle="--", label="Alpha Loss (smoothed)")
         axes[3, 0].set_title("Alpha Loss")
         axes[3, 0].set_xlabel("Episode")
         axes[3, 0].set_ylabel("Loss")
@@ -523,7 +768,7 @@ def train(cfg):
         entropy_vals = [v if v is not None else np.nan for v in entropy_hist]
         entropy_smooth = smooth_series(entropy_vals, smooth_window)
         axes[3, 1].plot(x, entropy_vals, color="#7f7f7f", label="Policy Entropy")
-        axes[3, 1].plot(x, entropy_smooth, color="#b3b3b3", linestyle="--", label="Policy Entropy (smoothed)")
+        axes[3, 1].plot(x, entropy_smooth, color="#b6ff00", linestyle="--", label="Policy Entropy (smoothed)")
         axes[3, 1].set_title("Policy Entropy")
         axes[3, 1].set_xlabel("Episode")
         axes[3, 1].set_ylabel("Entropy")

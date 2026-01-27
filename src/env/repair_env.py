@@ -93,7 +93,25 @@ class RepairEnv:
     def reset(self, damaged_ratio: float = 0.3) -> EnvState:
         damaged_count = max(1, int(self.num_edges * damaged_ratio))
         self.is_damaged = np.zeros(self.num_edges, dtype=np.float32)
-        damaged_indices = self.rng.choice(self.num_edges, size=damaged_count, replace=False)
+        max_retries = 50
+        damaged_indices = None
+        for _ in range(max_retries):
+            candidate = self.rng.choice(self.num_edges, size=damaged_count, replace=False)
+            damaged_mask = np.zeros(self.num_edges, dtype=np.float32)
+            damaged_mask[candidate] = 1.0
+            active_edges = [
+                (u, v)
+                for u, v, data in self.nx_graph.edges(data=True)
+                if damaged_mask[data["edge_id"]] == 0
+            ]
+            if not active_edges:
+                continue
+            subgraph = self.nx_graph.edge_subgraph(active_edges).copy()
+            if nx.is_strongly_connected(subgraph):
+                damaged_indices = candidate
+                break
+        if damaged_indices is None:
+            damaged_indices = self.rng.choice(self.num_edges, size=damaged_count, replace=False)
         self.is_damaged[damaged_indices] = 1.0
 
         self.capacities = self.initial_capacities.copy()
