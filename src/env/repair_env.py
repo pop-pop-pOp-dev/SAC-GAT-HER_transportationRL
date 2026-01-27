@@ -309,7 +309,11 @@ class RepairEnv:
 
     def compute_tstt(self, flow: np.ndarray, t: np.ndarray, unassigned_demand: float = 0.0) -> float:
         base = float(np.sum(flow * t))
-        penalty = float(self.unassigned_penalty) if unassigned_demand > 0 else 0.0
+        if unassigned_demand > 0:
+            frac = float(unassigned_demand) / max(self.total_demand, 1.0)
+            penalty = float(self.unassigned_penalty) * frac
+        else:
+            penalty = 0.0
         return base + penalty
 
     def shortest_path_edges(self, origin: int, dest: int, t: np.ndarray) -> List[int]:
@@ -348,8 +352,23 @@ class RepairEnv:
             raw_vc[i] = self.flow[i] / max(self.capacities[i], 1e-6)
         vc = np.where(self.is_damaged > 0, 0.0, raw_vc)
         vc = np.log1p(vc)
+        vc = np.clip(vc, 0.0, 5.0)
 
-        node_features = np.stack([bw_vec], axis=1)
+        goal_total = float(np.sum(self.goal_mask))
+        remaining = float(np.sum(self.goal_mask * self.is_damaged))
+        remaining_ratio = remaining / max(goal_total, 1.0)
+        
+        avg_flow = float(np.mean(self.flow[self.is_damaged == 0])) if np.sum(self.is_damaged == 0) > 0 else 0.0
+        avg_flow_norm = avg_flow / max(self.total_demand / max(self.num_edges, 1), 1.0)
+        
+        node_features = np.stack(
+            [
+                bw_vec,
+                np.full(self.num_nodes, remaining_ratio, dtype=np.float32),
+                np.full(self.num_nodes, avg_flow_norm, dtype=np.float32),
+            ],
+            axis=1,
+        )
 
         edge_id_norm = np.arange(self.num_edges, dtype=np.float32) / max(self.num_edges - 1, 1)
 

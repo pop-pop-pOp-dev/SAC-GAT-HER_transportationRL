@@ -2,7 +2,11 @@ data_dir: ./data
 output_dir: /root/autodl-tmp/resilence/outputs
 model_dir: /root/autodl-tmp/resilence/outputs
 damaged_ratio: 0.3
-assignment_iters: 200
+assignment_iters: 80
+# Optional schedule (uncomment/tune if needed):
+assignment_iters_start: 20
+assignment_iters_end: 120
+assignment_iters_warmup_episodes: 2000
 assignment_method: fw
 use_cugraph: false
 episodes: 5000
@@ -14,10 +18,10 @@ per_beta: 0.4
 per_eps: 1.0e-6
 reward_scale: 1.0
 reward_mode: log_delta
-reward_alpha: 10.0
+reward_alpha: 50.0
 reward_beta: 10.0
 reward_gamma: 0.01
-reward_clip: 10.0
+reward_clip: 0.0
 capacity_damage: 1.0e-3
 unassigned_penalty: 5.0e8
 debug_reward: true

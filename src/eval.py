@@ -62,7 +62,7 @@ def evaluate(cfg):
         if model_path and os.path.exists(model_path):
             device = torch.device(cfg.get("device", "cpu"))
             agent = DiscreteSAC(
-                node_in=1,
+                node_in=3,
                 edge_in=6,
                 hidden=cfg["hidden_dim"],
                 embed=cfg["embed_dim"],
