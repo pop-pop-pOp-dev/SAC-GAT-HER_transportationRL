@@ -145,72 +145,65 @@ class DiscreteSAC:
         return SACOutput(action=action, log_prob=log_prob, probs=probs)
 
     def update(self, batch, weights=None, alpha_max: float = None):
-        if isinstance(batch, list):
-            samples = batch
-        else:
-            samples = [batch]
+        if isinstance(batch, list) and len(batch) == 1:
+            batch = batch[0]
+
+        (
+            node_x,
+            edge_index,
+            edge_attr,
+            action_mask,
+            batch_vec,
+            action,
+            reward,
+            next_node_x,
+            next_edge_attr,
+            next_action_mask,
+            next_batch_vec,
+            done,
+        ) = batch
+
         if weights is None:
-            weights = [1.0] * len(samples)
+            weights_tensor = torch.ones_like(reward)
+        else:
+            weights_tensor = torch.as_tensor(weights, device=reward.device, dtype=reward.dtype)
+            if weights_tensor.dim() == 0:
+                weights_tensor = weights_tensor.unsqueeze(0).expand_as(reward)
 
-        critic_losses = []
-        actor_losses = []
-        alpha_losses = []
-        td_errors = []
+        edge_batch = batch_vec[edge_index[0]]
+        with torch.no_grad():
+            _, next_probs, _ = self.actor(next_node_x, edge_index, next_edge_attr, next_action_mask, next_batch_vec)
+            q1_next = self.target1(next_node_x, edge_index, next_edge_attr, next_batch_vec)
+            q2_next = self.target2(next_node_x, edge_index, next_edge_attr, next_batch_vec)
+            q_next = torch.min(q1_next, q2_next)
+            v_next = scatter_sum(next_probs * (q_next - self.alpha * torch.log(next_probs + 1e-8)), edge_batch, dim=0)
+            target = reward + (1.0 - done) * self.gamma * v_next
 
-        for idx, sample in enumerate(samples):
-            (
-                node_x,
-                edge_index,
-                edge_attr,
-                action_mask,
-                batch_vec,
-                action,
-                reward,
-                next_node_x,
-                next_edge_attr,
-                next_action_mask,
-                next_batch_vec,
-                done,
-            ) = sample
+        q1_all = self.critic1(node_x, edge_index, edge_attr, batch_vec)
+        q2_all = self.critic2(node_x, edge_index, edge_attr, batch_vec)
+        q1 = q1_all[action]
+        q2 = q2_all[action]
 
-            edge_batch = batch_vec[edge_index[0]]
-            with torch.no_grad():
-                _, next_probs, _ = self.actor(next_node_x, edge_index, next_edge_attr, next_action_mask, next_batch_vec)
-                q1_next = self.target1(next_node_x, edge_index, next_edge_attr, next_batch_vec)
-                q2_next = self.target2(next_node_x, edge_index, next_edge_attr, next_batch_vec)
-                q_next = torch.min(q1_next, q2_next)
-                v_next = scatter_sum(next_probs * (q_next - self.alpha * torch.log(next_probs + 1e-8)), edge_batch, dim=0)
-                target = reward + (1.0 - done) * self.gamma * v_next
+        td_error = (target - q1).detach().abs()
+        td_errors_list = td_error.cpu().numpy().tolist()
 
-            q1_all = self.critic1(node_x, edge_index, edge_attr, batch_vec)
-            q2_all = self.critic2(node_x, edge_index, edge_attr, batch_vec)
-            q1 = q1_all[action]
-            q2 = q2_all[action]
+        loss1 = F.mse_loss(q1, target, reduction="none")
+        loss2 = F.mse_loss(q2, target, reduction="none")
+        critic_loss = (weights_tensor * (loss1 + loss2)).mean()
 
-            td_error = (target - q1).detach()
-            td_errors.extend(td_error.cpu().numpy().tolist())
+        logits, probs, _ = self.actor(node_x, edge_index, edge_attr, action_mask, batch_vec)
+        q_all = torch.min(q1_all, q2_all).detach()
+        actor_terms = probs * (self.alpha * torch.log(probs + 1e-8) - q_all)
+        actor_loss = scatter_sum(actor_terms, edge_batch, dim=0).mean()
 
-            w = torch.as_tensor(weights[idx], device=reward.device, dtype=reward.dtype)
-            critic_losses.append(w * (F.mse_loss(q1, target) + F.mse_loss(q2, target)))
-
-            logits, probs, _ = self.actor(node_x, edge_index, edge_attr, action_mask, batch_vec)
-            q_all = torch.min(q1_all, q2_all).detach()
-            actor_terms = probs * (self.alpha * torch.log(probs + 1e-8) - q_all)
-            actor_loss = scatter_sum(actor_terms, edge_batch, dim=0).mean()
-            actor_losses.append(actor_loss)
-
-            if self.target_entropy is None:
-                valid = scatter_sum((action_mask > 0).float(), edge_batch, dim=0)
-                target_entropy = (-0.6 * torch.log(valid + 1e-8)).mean()
-            else:
-                target_entropy = self.target_entropy
-            log_probs = torch.log(probs + 1e-8).detach()
-            alpha_term = scatter_sum(probs.detach() * (log_probs + target_entropy), edge_batch, dim=0)
-            alpha_losses.append(-(self.log_alpha * alpha_term).mean())
-
-        critic_loss = torch.stack(critic_losses).mean()
-        actor_loss = torch.stack(actor_losses).mean()
-        alpha_loss = torch.stack(alpha_losses).mean()
+        if self.target_entropy is None:
+            valid = scatter_sum((action_mask > 0).float(), edge_batch, dim=0)
+            target_entropy = (-0.6 * torch.log(valid + 1e-8)).mean()
+        else:
+            target_entropy = self.target_entropy
+        log_probs = torch.log(probs + 1e-8).detach()
+        alpha_term = scatter_sum(probs.detach() * (log_probs + target_entropy), edge_batch, dim=0)
+        alpha_loss = -(self.log_alpha * alpha_term).mean()
 
         self.critic_opt.zero_grad()
         critic_loss.backward()
@@ -247,7 +240,7 @@ class DiscreteSAC:
             "critic_loss": critic_loss.item(),
             "actor_loss": actor_loss.item(),
             "alpha": self.alpha.item(),
-            "td_errors": td_errors,
+            "td_errors": td_errors_list,
         }
 
     def save(self, path: str):
