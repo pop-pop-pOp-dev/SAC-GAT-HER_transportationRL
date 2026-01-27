@@ -186,8 +186,10 @@ class DiscreteSAC:
             q2_all = self.critic2(node_x, edge_index, edge_attr, batch_vec)
             q1 = q1_all[action]
             q2 = q2_all[action]
+
             td_error = (target - q1).detach()
-            td_errors.append(td_error.mean().item())
+            td_errors.extend(td_error.cpu().numpy().tolist())
+
             w = torch.as_tensor(weights[idx], device=reward.device, dtype=reward.dtype)
             critic_losses.append(w * (F.mse_loss(q1, target) + F.mse_loss(q2, target)))
 
