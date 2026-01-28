@@ -11,7 +11,7 @@ assignment_method: fw
 use_cugraph: true
 episodes: 5000
 buffer_size: 1000000
-batch_start: 500
+batch_start: 2048
 update_every: 2
 updates_per_step: 4
 num_workers: 16
@@ -57,3 +57,4 @@ graphml_path: ./maps_simu/sioux_falls.graphml
 alpha_max: 1.0
 save_best: true
 alpha_init: 0.1
+target_entropy_ratio: 0.6

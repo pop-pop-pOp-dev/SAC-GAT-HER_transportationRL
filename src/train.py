@@ -256,6 +256,7 @@ def train(cfg):
         target_tau=cfg["target_tau"],
         share_critic_encoder=cfg.get("share_critic_encoder", True),
         alpha_init=cfg.get("alpha_init", 0.1),
+        target_entropy_ratio=cfg.get("target_entropy_ratio", 0.6),
     )
     agent.actor.to(device)
     agent.critic1.to(device)

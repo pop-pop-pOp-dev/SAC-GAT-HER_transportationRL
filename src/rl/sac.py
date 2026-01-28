@@ -23,6 +23,8 @@ class SACOutput:
 class Actor(nn.Module):
     def __init__(self, node_in: int, edge_in: int, hidden: int, embed: int, num_layers: int = 3):
         super().__init__()
+        self.node_norm = nn.LayerNorm(node_in)
+        self.edge_norm = nn.LayerNorm(edge_in)
         self.encoder = GATEncoder(node_in, hidden, embed, edge_dim=edge_in, num_layers=num_layers)
         self.edge_mlp = nn.Sequential(
             nn.Linear(embed * 4 + edge_in, hidden),
@@ -31,6 +33,8 @@ class Actor(nn.Module):
         )
 
     def forward(self, node_x, edge_index, edge_attr, action_mask, batch, return_attention: bool = False):
+        node_x = self.node_norm(node_x)
+        edge_attr = self.edge_norm(edge_attr)
         node_emb, global_ctx, attn = self.encoder(node_x, edge_index, edge_attr, batch, return_attention=return_attention)
         src, dst = edge_index
         edge_batch = batch[edge_index[0]]
@@ -53,6 +57,8 @@ class Critic(nn.Module):
         encoder: GATEncoder | None = None,
     ):
         super().__init__()
+        self.node_norm = nn.LayerNorm(node_in)
+        self.edge_norm = nn.LayerNorm(edge_in)
         self.encoder = encoder if encoder is not None else GATEncoder(node_in, hidden, embed, edge_dim=edge_in, num_layers=num_layers)
         self.edge_mlp = nn.Sequential(
             nn.Linear(embed * 4 + edge_in, hidden),
@@ -61,6 +67,8 @@ class Critic(nn.Module):
         )
 
     def forward(self, node_x, edge_index, edge_attr, batch):
+        node_x = self.node_norm(node_x)
+        edge_attr = self.edge_norm(edge_attr)
         node_emb, global_ctx, _ = self.encoder(node_x, edge_index, edge_attr, batch)
         src, dst = edge_index
         edge_batch = batch[edge_index[0]]
@@ -86,6 +94,7 @@ class DiscreteSAC:
         gamma: float = 0.99,
         target_tau: float = 0.005,
         target_entropy: float = None,
+        target_entropy_ratio: float = 0.6,
         alpha_init: float = 0.1,
         share_critic_encoder: bool = True,
     ):
@@ -127,6 +136,7 @@ class DiscreteSAC:
         self.gamma = gamma
         self.target_tau = target_tau
         self.target_entropy = target_entropy
+        self.target_entropy_ratio = target_entropy_ratio
         self.grad_clip = grad_clip
 
     @property
@@ -198,7 +208,7 @@ class DiscreteSAC:
 
         if self.target_entropy is None:
             valid = scatter_sum((action_mask > 0).float(), edge_batch, dim=0)
-            target_entropy = (0.6 * torch.log(valid + 1e-8)).mean()
+            target_entropy = (self.target_entropy_ratio * torch.log(valid + 1e-8)).mean()
         else:
             target_entropy = self.target_entropy
         log_probs = torch.log(probs + 1e-8).detach()
