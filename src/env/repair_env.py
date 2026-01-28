@@ -383,6 +383,9 @@ class RepairEnv:
         avg_flow = float(np.mean(self.flow[self.is_damaged == 0])) if np.sum(self.is_damaged == 0) > 0 else 0.0
         avg_flow_norm = avg_flow / max(self.total_demand / max(self.num_edges, 1), 1.0)
         
+        current_tstt = self.tstt if self.tstt is not None else self.initial_tstt
+        log_tstt_val = float(np.log10(max(current_tstt, 1.0))) if current_tstt is not None else 0.0
+
         node_features = np.stack(
             [
                 bw_vec,
@@ -410,8 +413,6 @@ class RepairEnv:
         )
 
         action_mask = self.is_damaged.astype(np.float32)
-        current_tstt = self.tstt if self.tstt is not None else self.initial_tstt
-        log_tstt_val = float(np.log10(max(current_tstt, 1.0))) if current_tstt is not None else 0.0
         return EnvState(
             node_features=node_features,
             edge_features=edge_features,

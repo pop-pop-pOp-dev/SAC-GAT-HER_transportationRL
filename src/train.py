@@ -278,6 +278,7 @@ def train(cfg):
     actor_hist = []
     alpha_loss_hist = []
     entropy_hist = []
+    eval_tstt_hist = []
     tb_dir = os.path.join(cfg["output_dir"], "tb")
     writer = SummaryWriter(log_dir=tb_dir)
     os.makedirs(cfg["output_dir"], exist_ok=True)
@@ -354,6 +355,8 @@ def train(cfg):
         actor_hist.append(last_losses.get("actor_loss") if last_losses else None)
         alpha_loss_hist.append(last_losses.get("alpha_loss") if last_losses else None)
         entropy_hist.append(last_losses.get("policy_entropy") if last_losses else None)
+        while len(eval_tstt_hist) < len(reward_hist):
+            eval_tstt_hist.append(np.nan)
         writer.add_scalar("train/reward", episode_reward, episode_idx)
         writer.add_scalar("train/tstt_mean", tstt_mean, episode_idx)
         writer.add_scalar("train/tstt_auc", tstt_auc, episode_idx)
@@ -506,6 +509,12 @@ def train(cfg):
         avg_reward = float(np.mean(eval_rewards))
         avg_tstt = float(np.mean(eval_tstt))
         avg_auc = float(np.mean(eval_auc))
+        while len(eval_tstt_hist) < episode_idx:
+            eval_tstt_hist.append(np.nan)
+        if len(eval_tstt_hist) == episode_idx:
+            eval_tstt_hist.append(avg_tstt)
+        else:
+            eval_tstt_hist[episode_idx] = avg_tstt
         writer.add_scalar("eval/avg_reward", avg_reward, episode_idx)
         writer.add_scalar("eval/avg_tstt", avg_tstt, episode_idx)
         writer.add_scalar("eval/avg_auc", avg_auc, episode_idx)
@@ -869,6 +878,9 @@ def train(cfg):
         tstt_last_smooth = smooth_series(tstt_last_vals, smooth_window)
         axes[2, 1].plot(x, tstt_last_vals, color="#8c564b", label="TSTT Last")
         axes[2, 1].plot(x, tstt_last_smooth, color="#ff00a8", linestyle="--", label="TSTT Last (smoothed)")
+        eval_tstt_smooth = smooth_series(eval_tstt_hist, smooth_window)
+        axes[2, 1].plot(x, eval_tstt_hist, color="#1f9bff", label="Eval TSTT")
+        axes[2, 1].plot(x, eval_tstt_smooth, color="#00e5ff", linestyle="--", label="Eval TSTT (smoothed)")
         axes[2, 1].set_title("TSTT Last (Episode End)")
         axes[2, 1].set_xlabel("Episode")
         axes[2, 1].set_ylabel("TSTT")

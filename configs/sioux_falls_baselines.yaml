@@ -47,7 +47,7 @@ target_tau: 0.001
 grad_clip: 0.5
 share_critic_encoder: true
 seed: 42
-eval_seeds: [43, 44, 45, 46, 47, 48, 49, 50, 51, 52]
+eval_seeds: [43]
 model_path: /root/autodl-tmp/resilence/outputs/baselines_eval/no_model.pt
 use_torch_bpr: true
 device: cpu
