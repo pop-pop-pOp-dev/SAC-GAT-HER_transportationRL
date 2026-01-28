@@ -41,6 +41,8 @@ def evaluate(cfg):
     graph = load_graph_data(data_paths["net_path"], data_paths["trips_path"])
     model_path = cfg.get("model_path")
 
+    reward_scale = float(cfg.get("reward_scale", 1.0))
+    max_steps = int(cfg.get("max_steps", 0)) if cfg.get("max_steps", 0) is not None else 0
     all_results: Dict[str, Dict] = {}
     for seed in eval_seeds:
         print(f"[eval] Start seed {seed}")
@@ -67,8 +69,7 @@ def evaluate(cfg):
         results: Dict[str, Dict] = {}
         baselines = get_baseline_policies(env)
         for name, policy in baselines.items():
-            result = run_episode(env, policy)
-            result["auc"] = float(np.trapezoid(result["tstt_curve"]))
+            result = run_episode(env, policy, reward_scale=reward_scale, max_steps=max_steps)
             results[name] = result
             all_results[f"seed_{seed}"] = results
             save_results(all_results, cfg["output_dir"])
@@ -96,14 +97,30 @@ def evaluate(cfg):
             agent.actor.to(device)
             env.reset(damaged_ratio=cfg["damaged_ratio"])
             tstt_curve: List[float] = []
+            total_reward = 0.0
             state = env.get_state()
             done = False
+            steps = 0
             while not done:
                 node_x, edge_index, edge_attr, action_mask = to_torch(state, device)
                 out = agent.select_action(node_x, edge_index, edge_attr, action_mask, deterministic=True)
                 state, reward, done, info = env.step(out.action)
-                tstt_curve.append(info["tstt"])
-            results["sac"] = {"tstt_curve": tstt_curve, "auc": float(np.trapezoid(tstt_curve))}
+                total_reward += reward * reward_scale
+                tstt_curve.append(info.get("tstt", env.tstt))
+                steps += 1
+                if max_steps > 0 and steps >= max_steps and not done:
+                    break
+            tstt_last = float(tstt_curve[-1]) if tstt_curve else env.tstt
+            tstt_mean = float(np.mean(tstt_curve)) if tstt_curve else env.tstt
+            tstt_auc = float(np.trapz(tstt_curve)) if tstt_curve else env.tstt
+            results["sac"] = {
+                "tstt_curve": tstt_curve,
+                "reward": total_reward,
+                "tstt_last": tstt_last,
+                "tstt_mean": tstt_mean,
+                "tstt_auc": tstt_auc,
+                "auc": tstt_auc,
+            }
             all_results[f"seed_{seed}"] = results
             save_results(all_results, cfg["output_dir"])
             print(f"[eval] Seed {seed} baseline sac done")

@@ -243,7 +243,13 @@ class RepairEnv:
             delta = np.log10(max(prev_tstt, 1.0)) - np.log10(max(curr_tstt, 1.0))
         elif mode == "minimize_tstt":
             base = self.initial_tstt if self.initial_tstt is not None else prev_tstt
-            delta = 1.0 - (curr_tstt / max(base, 1.0))
+            ratio = curr_tstt / max(base, 1.0)
+            reward = -ratio
+            complete_bonus = beta if self.is_goal_complete(goal_mask, damaged_mask) else 0.0
+            reward = reward + complete_bonus
+            if clip and clip > 0:
+                reward = float(np.clip(reward, -clip, clip))
+            return reward
         elif mode == "rel_improve":
             base = self.initial_tstt if self.initial_tstt is not None else prev_tstt
             delta = ((prev_tstt - curr_tstt) / max(base, 1.0)) * 100.0
