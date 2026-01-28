@@ -24,7 +24,7 @@ batch_size: 256
 per_alpha: 0.6
 per_beta: 0.4
 per_eps: 1.0e-6
-reward_scale: 0.01
+reward_scale: 0.05
 reward_mode: rel_improve
 reward_alpha: 10.0
 reward_beta: 10.0
@@ -66,4 +66,4 @@ graphml_path: ./maps_simu/sioux_falls.graphml
 alpha_max: 1.0
 save_best: true
 alpha_init: 1.0
-target_entropy_ratio: 0.98
+target_entropy_ratio: 0.6

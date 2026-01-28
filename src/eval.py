@@ -52,6 +52,8 @@ def evaluate(cfg):
             use_cugraph=cfg.get("use_cugraph", False),
             use_torch=cfg.get("use_torch_bpr", False),
             device=cfg.get("device", "cpu"),
+            sp_backend=cfg.get("sp_backend", "auto"),
+            force_gpu_sp=cfg.get("force_gpu_sp", False),
             reward_mode=cfg.get("reward_mode", "log_delta"),
             reward_alpha=cfg.get("reward_alpha", 1.0),
             reward_beta=cfg.get("reward_beta", 10.0),
