@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from typing import Dict, List
 
@@ -12,6 +13,16 @@ from src.baselines import get_baseline_policies, run_episode
 from src.data.tntp_download import download_sioux_falls
 from src.data.tntp_parser import load_graph_data
 from src.env.repair_env import RepairEnv
+
+
+def save_results(all_results: Dict[str, Dict], output_dir: str) -> None:
+    os.makedirs(output_dir, exist_ok=True)
+    npy_path = os.path.join(output_dir, "eval_metrics.npy")
+    json_path = os.path.join(output_dir, "eval_metrics.json")
+    np.save(npy_path, all_results)
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(all_results, f, ensure_ascii=False, indent=2)
+    print(f"[eval] Saved metrics to {npy_path} and {json_path}")
 
 
 def evaluate(cfg):
@@ -32,6 +43,7 @@ def evaluate(cfg):
 
     all_results: Dict[str, Dict] = {}
     for seed in eval_seeds:
+        print(f"[eval] Start seed {seed}")
         env = RepairEnv(
             graph,
             damaged_ratio=cfg["damaged_ratio"],
@@ -56,6 +68,9 @@ def evaluate(cfg):
             result = run_episode(env, policy)
             result["auc"] = float(np.trapezoid(result["tstt_curve"]))
             results[name] = result
+            all_results[f"seed_{seed}"] = results
+            save_results(all_results, cfg["output_dir"])
+            print(f"[eval] Seed {seed} baseline {name} done")
 
         if model_path and os.path.exists(model_path):
             from src.rl.sac import DiscreteSAC
@@ -87,13 +102,13 @@ def evaluate(cfg):
                 state, reward, done, info = env.step(out.action)
                 tstt_curve.append(info["tstt"])
             results["sac"] = {"tstt_curve": tstt_curve, "auc": float(np.trapezoid(tstt_curve))}
+            all_results[f"seed_{seed}"] = results
+            save_results(all_results, cfg["output_dir"])
+            print(f"[eval] Seed {seed} baseline sac done")
 
         all_results[f"seed_{seed}"] = results
-
-    os.makedirs(cfg["output_dir"], exist_ok=True)
-    out_path = os.path.join(cfg["output_dir"], "eval_metrics.npy")
-    np.save(out_path, all_results)
-    print(f"Saved eval metrics to {out_path}")
+        save_results(all_results, cfg["output_dir"])
+        print(f"[eval] Seed {seed} done")
 
 
 def main():

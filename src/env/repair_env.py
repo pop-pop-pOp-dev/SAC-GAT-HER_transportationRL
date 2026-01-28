@@ -31,6 +31,8 @@ class RepairEnv:
         use_cugraph: bool = False,
         use_torch: bool = False,
         device: str = "cpu",
+        sp_backend: str = "auto",
+        force_gpu_sp: bool = False,
         reward_mode: str = "log_delta",
         reward_alpha: float = 1.0,
         reward_beta: float = 10.0,
@@ -50,6 +52,12 @@ class RepairEnv:
         self.use_cugraph = use_cugraph
         self.use_torch = use_torch
         self.device = device
+        self.sp_backend = (sp_backend or "auto").lower()
+        self.force_gpu_sp = bool(force_gpu_sp)
+        self.use_cupy = False
+        self.use_torch_sp = False
+        self._sp_backend_logged = False
+        self._validate_accel()
         self.reward_mode = reward_mode
         self.reward_alpha = reward_alpha
         self.reward_beta = reward_beta
@@ -85,6 +93,58 @@ class RepairEnv:
         self.nx_graph = nx.DiGraph()
         for idx, e in enumerate(self.edges):
             self.nx_graph.add_edge(e.u - 1, e.v - 1, edge_id=idx)
+
+    def _validate_accel(self) -> None:
+        if self.sp_backend == "cugraph":
+            self.use_cugraph = True
+            try:
+                import cudf  # noqa: F401
+                import cugraph  # noqa: F401
+            except Exception as exc:
+                if self.force_gpu_sp:
+                    raise RuntimeError(f"cugraph unavailable: {exc}") from exc
+                self.use_cugraph = False
+        elif self.sp_backend == "cupy":
+            self.use_cugraph = False
+            try:
+                import cupy  # noqa: F401
+                import cupyx.scipy.sparse  # noqa: F401
+                import cupyx.scipy.sparse.csgraph  # noqa: F401
+                self.use_cupy = True
+            except Exception as exc:
+                if self.force_gpu_sp:
+                    raise RuntimeError(f"cupy backend unavailable: {exc}") from exc
+        elif self.sp_backend == "torch":
+            self.use_cugraph = False
+            try:
+                import torch
+
+                self.use_torch_sp = torch.cuda.is_available() and str(self.device).startswith("cuda")
+                if self.force_gpu_sp and not self.use_torch_sp:
+                    raise RuntimeError("torch GPU backend requested but CUDA is unavailable or device is CPU")
+            except Exception as exc:
+                if self.force_gpu_sp:
+                    raise RuntimeError(f"torch backend unavailable: {exc}") from exc
+        else:
+            # auto: prefer cugraph, then cupy, then cpu
+            if self.use_cugraph:
+                try:
+                    import cudf  # noqa: F401
+                    import cugraph  # noqa: F401
+                except Exception:
+                    self.use_cugraph = False
+            if not self.use_cugraph:
+                try:
+                    import cupy  # noqa: F401
+                    import cupyx.scipy.sparse  # noqa: F401
+                    import cupyx.scipy.sparse.csgraph  # noqa: F401
+                    self.use_cupy = True
+                except Exception as exc:
+                    if self.force_gpu_sp:
+                        raise RuntimeError(f"no GPU shortest-path backend available: {exc}") from exc
+        if self.use_torch and str(self.device).startswith("cpu"):
+            # Avoid torch overhead on CPU for BPR.
+            self.use_torch = False
 
     def _init_betweenness(self):
         self.betweenness = nx.betweenness_centrality(self.nx_graph, normalized=True)
@@ -214,19 +274,155 @@ class RepairEnv:
     def _all_or_nothing(self, t: np.ndarray) -> Tuple[np.ndarray, float]:
         aux_flow = np.zeros(self.num_edges, dtype=np.float32)
         unassigned = 0.0
-        for origin in range(self.num_nodes):
-            dests = [d for (o, d) in self.graph_data.od_demand.keys() if o - 1 == origin]
-            if not dests:
-                continue
-            paths = self._shortest_paths_from_origin(origin, t)
-            for dest in dests:
-                demand = self.graph_data.od_demand[(origin + 1, dest)]
-                path_edges = paths.get(dest - 1, [])
-                if not path_edges:
-                    unassigned += demand
+        if self.use_cugraph:
+            for origin in range(self.num_nodes):
+                dests = [d for (o, d) in self.graph_data.od_demand.keys() if o - 1 == origin]
+                if not dests:
                     continue
-                for e_id in path_edges:
-                    aux_flow[e_id] += demand
+                paths = self._shortest_paths_from_origin(origin, t)
+                for dest in dests:
+                    demand = self.graph_data.od_demand[(origin + 1, dest)]
+                    path_edges = paths.get(dest - 1, [])
+                    if not path_edges:
+                        unassigned += demand
+                        continue
+                    for e_id in path_edges:
+                        aux_flow[e_id] += demand
+            return aux_flow, unassigned
+
+        if self.use_cupy:
+            try:
+                import cupy as cp
+                from cupyx.scipy.sparse import csr_matrix as cp_csr_matrix
+                from cupyx.scipy.sparse.csgraph import dijkstra as cp_dijkstra
+
+                row = cp.asarray(self.edge_index[0])
+                col = cp.asarray(self.edge_index[1])
+                weights = cp.asarray(t, dtype=cp.float32)
+                graph = cp_csr_matrix((weights, (row, col)), shape=(self.num_nodes, self.num_nodes))
+                _, predecessors = cp_dijkstra(
+                    graph,
+                    directed=True,
+                    indices=cp.arange(self.num_nodes),
+                    return_predecessors=True,
+                )
+                pred_host = cp.asnumpy(predecessors)
+                for origin in range(self.num_nodes):
+                    dests = [d for (o, d) in self.graph_data.od_demand.keys() if o - 1 == origin]
+                    if not dests:
+                        continue
+                    pred_row = pred_host[origin]
+                    for dest in dests:
+                        demand = self.graph_data.od_demand[(origin + 1, dest)]
+                        path_edges = self._path_edges_from_predecessors(origin, dest - 1, pred_row)
+                        if not path_edges:
+                            unassigned += demand
+                            continue
+                        for e_id in path_edges:
+                            aux_flow[e_id] += demand
+                if not self._sp_backend_logged:
+                    print("\033[92m[env] shortest-path backend: CuPy (GPU)\033[0m")
+                    self._sp_backend_logged = True
+                return aux_flow, unassigned
+            except Exception as exc:
+                if self.force_gpu_sp:
+                    raise RuntimeError(f"cupy shortest-path failed: {exc}") from exc
+
+        if self.use_torch_sp:
+            return self._all_or_nothing_torch(t)
+
+        try:
+            from scipy.sparse import csr_matrix
+            from scipy.sparse.csgraph import dijkstra
+
+            row = self.edge_index[0]
+            col = self.edge_index[1]
+            weights = t.copy()
+            graph = csr_matrix((weights, (row, col)), shape=(self.num_nodes, self.num_nodes))
+            _, predecessors = dijkstra(graph, directed=True, indices=range(self.num_nodes), return_predecessors=True)
+            for origin in range(self.num_nodes):
+                dests = [d for (o, d) in self.graph_data.od_demand.keys() if o - 1 == origin]
+                if not dests:
+                    continue
+                pred_row = predecessors[origin]
+                for dest in dests:
+                    demand = self.graph_data.od_demand[(origin + 1, dest)]
+                    path_edges = self._path_edges_from_predecessors(origin, dest - 1, pred_row)
+                    if not path_edges:
+                        unassigned += demand
+                        continue
+                    for e_id in path_edges:
+                        aux_flow[e_id] += demand
+            return aux_flow, unassigned
+        except Exception:
+            for origin in range(self.num_nodes):
+                dests = [d for (o, d) in self.graph_data.od_demand.keys() if o - 1 == origin]
+                if not dests:
+                    continue
+                paths = self._shortest_paths_from_origin(origin, t)
+                for dest in dests:
+                    demand = self.graph_data.od_demand[(origin + 1, dest)]
+                    path_edges = paths.get(dest - 1, [])
+                    if not path_edges:
+                        unassigned += demand
+                        continue
+                    for e_id in path_edges:
+                        aux_flow[e_id] += demand
+            return aux_flow, unassigned
+
+    def _all_or_nothing_torch(self, t: np.ndarray) -> Tuple[np.ndarray, float]:
+        import torch
+
+        device = torch.device(self.device)
+        n = self.num_nodes
+        inf = torch.tensor(1e12, device=device, dtype=torch.float32)
+        dist = torch.full((n, n), inf, device=device, dtype=torch.float32)
+        next_hop = torch.full((n, n), -1, device=device, dtype=torch.int64)
+        idx = torch.arange(n, device=device)
+        dist[idx, idx] = 0.0
+
+        row = torch.tensor(self.edge_index[0], device=device, dtype=torch.long)
+        col = torch.tensor(self.edge_index[1], device=device, dtype=torch.long)
+        weight = torch.tensor(t, device=device, dtype=torch.float32)
+        dist[row, col] = weight
+        next_hop[row, col] = col
+
+        for k in range(n):
+            alt = dist[:, k].unsqueeze(1) + dist[k, :].unsqueeze(0)
+            mask = alt < dist
+            dist = torch.where(mask, alt, dist)
+            nk = next_hop[:, k].unsqueeze(1).expand_as(next_hop)
+            next_hop = torch.where(mask, nk, next_hop)
+
+        next_cpu = next_hop.detach().cpu().numpy()
+        aux_flow = np.zeros(self.num_edges, dtype=np.float32)
+        unassigned = 0.0
+
+        for (o, d), demand in self.graph_data.od_demand.items():
+            origin = o - 1
+            dest = d - 1
+            if origin == dest:
+                continue
+            path_edges: List[int] = []
+            cur = origin
+            hops = 0
+            while cur != dest and cur != -1 and hops < n:
+                nxt = int(next_cpu[cur, dest])
+                if nxt < 0:
+                    path_edges = []
+                    break
+                path_edges.append(self.edge_id_map[(cur, nxt)])
+                cur = nxt
+                hops += 1
+            if cur != dest:
+                unassigned += demand
+                continue
+            for e_id in path_edges:
+                aux_flow[e_id] += demand
+
+        if not self._sp_backend_logged:
+            print("\033[92m[env] shortest-path backend: Torch (GPU)\033[0m")
+            self._sp_backend_logged = True
         return aux_flow, unassigned
 
     def _shortest_paths_from_origin(self, origin: int, t: np.ndarray) -> Dict[int, List[int]]:
@@ -242,9 +438,15 @@ class RepairEnv:
                         "weight": t,
                     }
                 )
-                G = cugraph.DiGraph()
+                if hasattr(cugraph, "DiGraph"):
+                    G = cugraph.DiGraph()
+                else:
+                    try:
+                        G = cugraph.Graph(directed=True)
+                    except TypeError:
+                        G = cugraph.Graph()
                 G.from_cudf_edgelist(df, source="src", destination="dst", edge_attr="weight")
-                sp = cugraph.shortest_path(G, source=origin)
+                sp = cugraph.sssp(G, source=origin)
                 paths = {}
                 if "predecessor" in sp.columns:
                     pred = sp.set_index("vertex")["predecessor"].to_pandas()
@@ -264,9 +466,15 @@ class RepairEnv:
                         for i in range(len(path_nodes) - 1):
                             edge_ids.append(self.edge_id_map[(path_nodes[i], path_nodes[i + 1])])
                         paths[dest] = edge_ids
+                    if not self._sp_backend_logged:
+                        print("\033[92m[env] shortest-path backend: cuGraph (GPU)\033[0m")
+                        self._sp_backend_logged = True
                     return paths
-            except Exception:
-                pass
+            except Exception as exc:
+                if not self._sp_backend_logged:
+                    print(f"\033[91m[env] cuGraph failed, falling back to CPU: {exc}\033[0m")
+                    self._sp_backend_logged = True
+                self.use_cugraph = False
         # Prefer scipy sparse dijkstra for speed; fallback to networkx.
         try:
             from scipy.sparse import csr_matrix
@@ -292,6 +500,9 @@ class RepairEnv:
                 for i in range(len(path_nodes) - 1):
                     edge_ids.append(self.edge_id_map[(path_nodes[i], path_nodes[i + 1])])
                 paths[dest] = edge_ids
+            if not self._sp_backend_logged:
+                print("\033[93m[env] shortest-path backend: SciPy (CPU)\033[0m")
+                self._sp_backend_logged = True
             return paths
         except Exception:
             paths = {}
@@ -301,6 +512,9 @@ class RepairEnv:
                 edge_ids = self.shortest_path_edges(origin, dest, t)
                 if edge_ids:
                     paths[dest] = edge_ids
+            if not self._sp_backend_logged:
+                print("\033[93m[env] shortest-path backend: NetworkX (CPU)\033[0m")
+                self._sp_backend_logged = True
             return paths
 
     def compute_travel_time(self, flow: np.ndarray) -> np.ndarray:
@@ -324,6 +538,23 @@ class RepairEnv:
         t = t0_t * (1.0 + self.bpr_alpha * (vc ** self.bpr_beta))
         t = torch.where(damaged_t > 0, torch.full_like(t, 1e6), t)
         return t.detach().cpu().numpy()
+
+    def _path_edges_from_predecessors(self, origin: int, dest: int, pred_row: np.ndarray) -> List[int]:
+        if dest == origin or pred_row[dest] < 0:
+            return []
+        path_nodes = []
+        cur = dest
+        while cur != origin and cur != -9999:
+            path_nodes.append(cur)
+            cur = int(pred_row[cur])
+        if cur != origin:
+            return []
+        path_nodes.append(origin)
+        path_nodes = path_nodes[::-1]
+        edge_ids = []
+        for i in range(len(path_nodes) - 1):
+            edge_ids.append(self.edge_id_map[(path_nodes[i], path_nodes[i + 1])])
+        return edge_ids
 
     def compute_tstt(self, flow: np.ndarray, t: np.ndarray, unassigned_demand: float = 0.0) -> float:
         flow_np = np.asarray(flow, dtype=np.float32)

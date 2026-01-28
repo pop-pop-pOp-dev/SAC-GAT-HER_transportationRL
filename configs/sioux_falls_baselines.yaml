@@ -8,7 +8,7 @@ assignment_iters_start: 20
 assignment_iters_end: 120
 assignment_iters_warmup_episodes: 2000
 assignment_method: fw
-use_cugraph: true
+use_cugraph: false
 episodes: 5000
 buffer_size: 1000000
 batch_start: 500

@@ -94,7 +94,7 @@ class DiscreteSAC:
         gamma: float = 0.99,
         target_tau: float = 0.005,
         target_entropy: float = None,
-        target_entropy_ratio: float = 0.6,
+        target_entropy_ratio: float = 0.1,
         alpha_init: float = 0.1,
         share_critic_encoder: bool = True,
     ):

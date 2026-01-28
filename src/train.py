@@ -143,9 +143,11 @@ def rollout_worker(worker_id, cfg, weights_queue, out_queue, stop_event):
         damaged_ratio=cfg["damaged_ratio"],
         assignment_iters=cfg["assignment_iters"],
         assignment_method=cfg.get("assignment_method", "msa"),
-        use_cugraph=cfg.get("use_cugraph", False),
-        use_torch=cfg.get("use_torch_bpr", False),
+        use_cugraph=cfg.get("worker_use_cugraph", False),
+        use_torch=cfg.get("worker_use_torch_bpr", False),
         device=str(device),
+        sp_backend=cfg.get("worker_sp_backend", "auto"),
+        force_gpu_sp=cfg.get("worker_force_gpu_sp", False),
         reward_mode=cfg.get("reward_mode", "delta"),
         reward_alpha=cfg.get("reward_alpha", 1.0),
         reward_beta=cfg.get("reward_beta", 10.0),
@@ -225,6 +227,8 @@ def train(cfg):
         use_cugraph=cfg.get("use_cugraph", False),
         use_torch=cfg.get("use_torch_bpr", False),
         device=str(device),
+        sp_backend=cfg.get("sp_backend", "auto"),
+        force_gpu_sp=cfg.get("force_gpu_sp", False),
         reward_mode=cfg.get("reward_mode", "delta"),
         reward_alpha=cfg.get("reward_alpha", 1.0),
         reward_beta=cfg.get("reward_beta", 10.0),
@@ -280,9 +284,10 @@ def train(cfg):
     alpha_loss_hist = []
     entropy_hist = []
     eval_tstt_hist = []
-    tb_dir = os.path.join(cfg["output_dir"], "tb")
-    writer = SummaryWriter(log_dir=tb_dir)
     os.makedirs(cfg["output_dir"], exist_ok=True)
+    tb_dir = os.path.join(cfg["output_dir"], "tb")
+    os.makedirs(tb_dir, exist_ok=True)
+    writer = SummaryWriter(log_dir=tb_dir)
     model_dir = cfg.get("model_dir", cfg["output_dir"])
     os.makedirs(model_dir, exist_ok=True)
     fig_path = os.path.join(cfg["output_dir"], "train_curves.png")
@@ -304,6 +309,9 @@ def train(cfg):
     eval_seeds = cfg.get("eval_seeds") or [1001, 1002, 1003, 1004, 1005]
     smooth_window = int(cfg.get("smooth_window", 10))
     plot_clip_percentile = float(cfg.get("plot_clip_percentile", 99.0))
+    plot_clip_percentile_auc = float(cfg.get("plot_clip_percentile_auc", plot_clip_percentile))
+    plot_clip_percentile_mean = float(cfg.get("plot_clip_percentile_mean", plot_clip_percentile))
+    plot_tstt_log = bool(cfg.get("plot_tstt_log", True))
 
     def smooth_series(values, window):
         if window <= 1:
@@ -336,9 +344,20 @@ def train(cfg):
             return arr
         return np.clip(arr, lo, hi)
 
+    def apply_ylim(ax, values, lower=1.0, upper=99.0):
+        vals = np.asarray([v for v in values if v is not None and np.isfinite(v)], dtype=np.float32)
+        if vals.size < 5:
+            return
+        lo = np.percentile(vals, lower)
+        hi = np.percentile(vals, upper)
+        if hi <= lo:
+            return
+        pad = 0.05 * (hi - lo)
+        ax.set_ylim(lo - pad, hi + pad)
+
     def record_episode(episode_idx, episode_reward, episode_tstt, last_losses, last_tstt, delta_tstt):
         tstt_mean = float(np.mean(episode_tstt)) if episode_tstt else last_tstt
-        tstt_auc = float(np.trapezoid(episode_tstt)) if episode_tstt else last_tstt
+        tstt_auc = float(np.trapz(episode_tstt)) if episode_tstt else last_tstt
         metrics.append(
             {
                 "episode": episode_idx,
@@ -367,19 +386,9 @@ def train(cfg):
             writer.add_scalar("train/alpha", last_losses.get("alpha", 0.0), episode_idx)
             writer.add_scalar("train/alpha_loss", last_losses.get("alpha_loss", 0.0), episode_idx)
             writer.add_scalar("train/policy_entropy", last_losses.get("policy_entropy", 0.0), episode_idx)
-        def apply_ylim(ax, values, lower=1.0, upper=99.0):
-            vals = np.asarray([v for v in values if v is not None and np.isfinite(v)], dtype=np.float32)
-            if vals.size < 5:
-                return
-            lo = np.percentile(vals, lower)
-            hi = np.percentile(vals, upper)
-            if hi <= lo:
-                return
-            pad = 0.05 * (hi - lo)
-            ax.set_ylim(lo - pad, hi + pad)
 
         if plot_every > 0 and (episode_idx + 1) % plot_every == 0:
-            fig, axes = plt.subplots(4, 2, figsize=(12, 16), sharex=True)
+            fig, axes = plt.subplots(5, 2, figsize=(12, 20), sharex=True)
             x = np.arange(len(reward_hist))
             reward_plot = clip_series(reward_hist, upper=plot_clip_percentile)
             reward_smooth = smooth_series(reward_plot, smooth_window)
@@ -391,23 +400,29 @@ def train(cfg):
             axes[0, 0].legend()
             apply_ylim(axes[0, 0], reward_plot)
 
-            tstt_mean_plot = clip_series(tstt_mean_hist, upper=plot_clip_percentile)
+            tstt_mean_raw = tstt_mean_hist
+            if plot_tstt_log:
+                tstt_mean_raw = np.log10(np.maximum(np.asarray(tstt_mean_raw, dtype=np.float32), 1e-6))
+            tstt_mean_plot = clip_series(tstt_mean_raw, upper=plot_clip_percentile_mean)
             tstt_mean_smooth = smooth_series(tstt_mean_plot, smooth_window)
             axes[0, 1].plot(x, tstt_mean_plot, color="#2ca02c", label="TSTT Mean")
             axes[0, 1].plot(x, tstt_mean_smooth, color="#00ff4f", linestyle="--", label="TSTT Mean (smoothed)")
             axes[0, 1].set_title("TSTT Mean")
             axes[0, 1].set_xlabel("Episode")
-            axes[0, 1].set_ylabel("TSTT")
+            axes[0, 1].set_ylabel("log10(TSTT)" if plot_tstt_log else "TSTT")
             axes[0, 1].legend()
             apply_ylim(axes[0, 1], tstt_mean_plot)
 
-            tstt_auc_plot = clip_series(tstt_auc_hist, upper=plot_clip_percentile)
+            tstt_auc_raw = tstt_auc_hist
+            if plot_tstt_log:
+                tstt_auc_raw = np.log10(np.maximum(np.asarray(tstt_auc_raw, dtype=np.float32), 1e-6))
+            tstt_auc_plot = clip_series(tstt_auc_raw, upper=plot_clip_percentile_auc)
             tstt_auc_smooth = smooth_series(tstt_auc_plot, smooth_window)
             axes[1, 0].plot(x, tstt_auc_plot, color="#9467bd", label="TSTT AUC")
             axes[1, 0].plot(x, tstt_auc_smooth, color="#ff00ff", linestyle="--", label="TSTT AUC (smoothed)")
             axes[1, 0].set_title("TSTT AUC")
             axes[1, 0].set_xlabel("Episode")
-            axes[1, 0].set_ylabel("AUC")
+            axes[1, 0].set_ylabel("log10(AUC)" if plot_tstt_log else "AUC")
             axes[1, 0].legend()
             apply_ylim(axes[1, 0], tstt_auc_plot)
 
@@ -419,6 +434,7 @@ def train(cfg):
             axes[1, 1].set_xlabel("Episode")
             axes[1, 1].set_ylabel("Loss")
             axes[1, 1].legend()
+            apply_ylim(axes[1, 1], critic_vals)
 
             actor_vals = [v if v is not None else np.nan for v in actor_hist]
             actor_smooth = smooth_series(actor_vals, smooth_window)
@@ -428,6 +444,7 @@ def train(cfg):
             axes[2, 0].set_xlabel("Episode")
             axes[2, 0].set_ylabel("Loss")
             axes[2, 0].legend()
+            apply_ylim(axes[2, 0], actor_vals)
 
             tstt_last_vals = [m["tstt_last"] for m in metrics]
             tstt_last_plot = clip_series(tstt_last_vals, upper=plot_clip_percentile)
@@ -448,6 +465,7 @@ def train(cfg):
             axes[3, 0].set_xlabel("Episode")
             axes[3, 0].set_ylabel("Loss")
             axes[3, 0].legend()
+            apply_ylim(axes[3, 0], alpha_loss_vals)
 
             entropy_vals = [v if v is not None else np.nan for v in entropy_hist]
             entropy_smooth = smooth_series(entropy_vals, smooth_window)
@@ -457,6 +475,24 @@ def train(cfg):
             axes[3, 1].set_xlabel("Episode")
             axes[3, 1].set_ylabel("Entropy")
             axes[3, 1].legend()
+            apply_ylim(axes[3, 1], entropy_vals)
+
+            eval_tstt_vals = [v if v is not None and np.isfinite(v) else np.nan for v in eval_tstt_hist]
+            axes[4, 0].plot(
+                x,
+                eval_tstt_vals,
+                color="#1f9bff",
+                marker="o",
+                markersize=3,
+                label="Eval TSTT",
+            )
+            axes[4, 0].set_title("Eval TSTT")
+            axes[4, 0].set_xlabel("Episode")
+            axes[4, 0].set_ylabel("TSTT")
+            axes[4, 0].legend()
+            apply_ylim(axes[4, 0], eval_tstt_vals)
+
+            axes[4, 1].axis("off")
 
             for ax in axes.ravel():
                 ax.grid(True, alpha=0.3)
@@ -479,6 +515,8 @@ def train(cfg):
                 use_cugraph=cfg.get("use_cugraph", False),
                 use_torch=cfg.get("use_torch_bpr", False),
                 device=str(device),
+                sp_backend=cfg.get("sp_backend", "auto"),
+                force_gpu_sp=cfg.get("force_gpu_sp", False),
                 reward_mode=cfg.get("reward_mode", "delta"),
                 reward_alpha=cfg.get("reward_alpha", 1.0),
                 reward_beta=cfg.get("reward_beta", 10.0),
@@ -505,7 +543,7 @@ def train(cfg):
                     break
             eval_rewards.append(total_reward)
             eval_tstt.append(float(tstt_curve[-1]) if tstt_curve else eval_env.tstt)
-            eval_auc.append(float(np.trapezoid(tstt_curve)) if tstt_curve else eval_env.tstt)
+            eval_auc.append(float(np.trapz(tstt_curve)) if tstt_curve else eval_env.tstt)
 
         avg_reward = float(np.mean(eval_rewards))
         avg_tstt = float(np.mean(eval_tstt))
@@ -528,12 +566,14 @@ def train(cfg):
         agent.actor.train()
     def resolve_worker_settings(cfg):
         cpu_count = os.cpu_count() or 1
-        raw_workers = cfg.get("num_workers", 0)
-        if isinstance(raw_workers, str) and raw_workers.lower() == "auto":
+        raw_workers = cfg.get("num_workers", None)
+        if raw_workers is None:
+            num_workers = max(1, min(16, cpu_count - 2))
+        elif isinstance(raw_workers, str) and raw_workers.lower() == "auto":
             num_workers = max(1, min(16, cpu_count - 2))
         else:
             num_workers = int(raw_workers)
-            if num_workers <= 0:
+            if num_workers < 0:
                 num_workers = max(1, min(16, cpu_count - 2))
 
         raw_steps = cfg.get("rollout_steps_per_worker", 0)
@@ -546,6 +586,49 @@ def train(cfg):
         return num_workers, rollout_steps
 
     num_workers, rollout_steps = resolve_worker_settings(cfg)
+    def _color(txt: str, code: str) -> str:
+        return f"\033[{code}m{txt}\033[0m"
+
+    torch_cuda = torch.cuda.is_available()
+    device_name = torch.cuda.get_device_name(0) if torch_cuda else "CPU"
+    print(
+        _color(
+            f"[accel] device={device} torch_cuda={torch_cuda} gpu={device_name}",
+            "92" if torch_cuda else "91",
+        )
+    )
+    print(
+        _color(
+            f"[accel] sp_backend={cfg.get('sp_backend', 'auto')} force_gpu_sp={cfg.get('force_gpu_sp', False)} use_torch_bpr={cfg.get('use_torch_bpr', False)}",
+            "96",
+        )
+    )
+    if num_workers > 0:
+        print(
+            _color(
+                f"[accel] parallel rollout=ON workers={num_workers} rollout_steps={rollout_steps}",
+                "92",
+            )
+        )
+        print(
+            _color(
+                f"[accel] worker backend=CPU sp_backend={cfg.get('worker_sp_backend', 'auto')} use_torch_bpr={cfg.get('worker_use_torch_bpr', False)}",
+                "93",
+            )
+        )
+    else:
+        print(
+            _color(
+                f"[accel] parallel rollout=OFF workers={num_workers}",
+                "93",
+            )
+        )
+    print(
+        _color(
+            f"[accel] batch_size={cfg.get('batch_size')} update_every={cfg.get('update_every')} updates_per_step={cfg.get('updates_per_step')}",
+            "96",
+        )
+    )
     if num_workers > 0:
         ctx = mp.get_context("spawn")
         queue_size = int(cfg.get("queue_size", 10000))
@@ -755,9 +838,9 @@ def train(cfg):
                 if replay.size > cfg["batch_start"] and (steps % update_every == 0):
                     for _ in range(updates_per_step):
                         bs = min(cfg["batch_size"], replay.size)
-                    batch_items, indices, weights = replay.sample(bs)
-                    if any(item is None for item in batch_items):
-                        continue
+                        batch_items, indices, weights = replay.sample(bs)
+                        if any(item is None for item in batch_items):
+                            continue
                         states = []
                         next_states = []
                         actions = []
@@ -831,7 +914,7 @@ def train(cfg):
     out_path = os.path.join(cfg["output_dir"], "train_metrics.npy")
     np.save(out_path, metrics)
     if plot_every <= 0:
-        fig, axes = plt.subplots(4, 2, figsize=(12, 16), sharex=True)
+        fig, axes = plt.subplots(5, 2, figsize=(12, 20), sharex=True)
         x = np.arange(len(reward_hist))
         reward_smooth = smooth_series(reward_hist, smooth_window)
         axes[0, 0].plot(x, reward_hist, color="#1f77b4", label="Reward")
@@ -840,22 +923,31 @@ def train(cfg):
         axes[0, 0].set_xlabel("Episode")
         axes[0, 0].set_ylabel("Scaled Reward")
         axes[0, 0].legend()
+        apply_ylim(axes[0, 0], reward_hist)
 
-        tstt_mean_smooth = smooth_series(tstt_mean_hist, smooth_window)
-        axes[0, 1].plot(x, tstt_mean_hist, color="#2ca02c", label="TSTT Mean")
+        tstt_mean_raw = tstt_mean_hist
+        if plot_tstt_log:
+            tstt_mean_raw = np.log10(np.maximum(np.asarray(tstt_mean_raw, dtype=np.float32), 1e-6))
+        tstt_mean_smooth = smooth_series(tstt_mean_raw, smooth_window)
+        axes[0, 1].plot(x, tstt_mean_raw, color="#2ca02c", label="TSTT Mean")
         axes[0, 1].plot(x, tstt_mean_smooth, color="#00ff4f", linestyle="--", label="TSTT Mean (smoothed)")
         axes[0, 1].set_title("TSTT Mean")
         axes[0, 1].set_xlabel("Episode")
-        axes[0, 1].set_ylabel("TSTT")
+        axes[0, 1].set_ylabel("log10(TSTT)" if plot_tstt_log else "TSTT")
         axes[0, 1].legend()
+        apply_ylim(axes[0, 1], tstt_mean_raw)
 
-        tstt_auc_smooth = smooth_series(tstt_auc_hist, smooth_window)
-        axes[1, 0].plot(x, tstt_auc_hist, color="#9467bd", label="TSTT AUC")
+        tstt_auc_raw = tstt_auc_hist
+        if plot_tstt_log:
+            tstt_auc_raw = np.log10(np.maximum(np.asarray(tstt_auc_raw, dtype=np.float32), 1e-6))
+        tstt_auc_smooth = smooth_series(tstt_auc_raw, smooth_window)
+        axes[1, 0].plot(x, tstt_auc_raw, color="#9467bd", label="TSTT AUC")
         axes[1, 0].plot(x, tstt_auc_smooth, color="#ff00ff", linestyle="--", label="TSTT AUC (smoothed)")
         axes[1, 0].set_title("TSTT AUC")
         axes[1, 0].set_xlabel("Episode")
-        axes[1, 0].set_ylabel("AUC")
+        axes[1, 0].set_ylabel("log10(AUC)" if plot_tstt_log else "AUC")
         axes[1, 0].legend()
+        apply_ylim(axes[1, 0], tstt_auc_raw)
 
         critic_vals = [v if v is not None else np.nan for v in critic_hist]
         critic_smooth = smooth_series(critic_vals, smooth_window)
@@ -865,6 +957,7 @@ def train(cfg):
         axes[1, 1].set_xlabel("Episode")
         axes[1, 1].set_ylabel("Loss")
         axes[1, 1].legend()
+        apply_ylim(axes[1, 1], critic_vals)
 
         actor_vals = [v if v is not None else np.nan for v in actor_hist]
         actor_smooth = smooth_series(actor_vals, smooth_window)
@@ -874,18 +967,18 @@ def train(cfg):
         axes[2, 0].set_xlabel("Episode")
         axes[2, 0].set_ylabel("Loss")
         axes[2, 0].legend()
+        apply_ylim(axes[2, 0], actor_vals)
 
         tstt_last_vals = [m["tstt_last"] for m in metrics]
-        tstt_last_smooth = smooth_series(tstt_last_vals, smooth_window)
-        axes[2, 1].plot(x, tstt_last_vals, color="#8c564b", label="TSTT Last")
+        tstt_last_plot = clip_series(tstt_last_vals, upper=plot_clip_percentile)
+        tstt_last_smooth = smooth_series(tstt_last_plot, smooth_window)
+        axes[2, 1].plot(x, tstt_last_plot, color="#8c564b", label="TSTT Last")
         axes[2, 1].plot(x, tstt_last_smooth, color="#ff00a8", linestyle="--", label="TSTT Last (smoothed)")
-        eval_tstt_smooth = smooth_series(eval_tstt_hist, smooth_window)
-        axes[2, 1].plot(x, eval_tstt_hist, color="#1f9bff", label="Eval TSTT")
-        axes[2, 1].plot(x, eval_tstt_smooth, color="#00e5ff", linestyle="--", label="Eval TSTT (smoothed)")
         axes[2, 1].set_title("TSTT Last (Episode End)")
         axes[2, 1].set_xlabel("Episode")
         axes[2, 1].set_ylabel("TSTT")
         axes[2, 1].legend()
+        apply_ylim(axes[2, 1], tstt_last_plot)
 
         alpha_loss_vals = [v if v is not None else np.nan for v in alpha_loss_hist]
         alpha_loss_smooth = smooth_series(alpha_loss_vals, smooth_window)
@@ -895,6 +988,7 @@ def train(cfg):
         axes[3, 0].set_xlabel("Episode")
         axes[3, 0].set_ylabel("Loss")
         axes[3, 0].legend()
+        apply_ylim(axes[3, 0], alpha_loss_vals)
 
         entropy_vals = [v if v is not None else np.nan for v in entropy_hist]
         entropy_smooth = smooth_series(entropy_vals, smooth_window)
@@ -904,6 +998,24 @@ def train(cfg):
         axes[3, 1].set_xlabel("Episode")
         axes[3, 1].set_ylabel("Entropy")
         axes[3, 1].legend()
+        apply_ylim(axes[3, 1], entropy_vals)
+
+        eval_tstt_vals = [v if v is not None and np.isfinite(v) else np.nan for v in eval_tstt_hist]
+        axes[4, 0].plot(
+            x,
+            eval_tstt_vals,
+            color="#1f9bff",
+            marker="o",
+            markersize=3,
+            label="Eval TSTT",
+        )
+        axes[4, 0].set_title("Eval TSTT")
+        axes[4, 0].set_xlabel("Episode")
+        axes[4, 0].set_ylabel("TSTT")
+        axes[4, 0].legend()
+        apply_ylim(axes[4, 0], eval_tstt_vals)
+
+        axes[4, 1].axis("off")
 
         for ax in axes.ravel():
             ax.grid(True, alpha=0.3)
