@@ -194,7 +194,7 @@ class RepairEnv:
         if action_edge_id < 0 or action_edge_id >= self.num_edges:
             raise ValueError(f"action_edge_id {action_edge_id} out of range (0..{self.num_edges - 1})")
         if self.is_damaged[action_edge_id] == 0:
-            reward = -5.0
+            reward = -1.0
             return self.get_state(), reward, False, {"tstt": self.tstt}
 
         prev_tstt = self.tstt
@@ -244,7 +244,7 @@ class RepairEnv:
         elif mode == "minimize_tstt":
             base = self.initial_tstt if self.initial_tstt is not None else prev_tstt
             ratio = curr_tstt / max(base, 1.0)
-            reward = -ratio
+            reward = -alpha * ratio
             complete_bonus = beta if self.is_goal_complete(goal_mask, damaged_mask) else 0.0
             reward = reward + complete_bonus
             if clip and clip > 0:

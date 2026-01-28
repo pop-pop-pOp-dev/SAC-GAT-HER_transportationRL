@@ -29,7 +29,7 @@ reward_mode: minimize_tstt
 reward_alpha: 1.0
 reward_beta: 0.0
 reward_gamma: 0.0
-reward_clip: 1.0
+reward_clip: 2.0
 gp_step: 1.0
 gp_keep_paths: 2
 capacity_damage: 1.0e-3
