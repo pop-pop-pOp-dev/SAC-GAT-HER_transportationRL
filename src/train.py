@@ -352,6 +352,17 @@ def train(cfg):
             writer.add_scalar("train/alpha", last_losses.get("alpha", 0.0), episode_idx)
             writer.add_scalar("train/alpha_loss", last_losses.get("alpha_loss", 0.0), episode_idx)
             writer.add_scalar("train/policy_entropy", last_losses.get("policy_entropy", 0.0), episode_idx)
+        def apply_ylim(ax, values, lower=1.0, upper=99.0):
+            vals = np.asarray([v for v in values if v is not None and np.isfinite(v)], dtype=np.float32)
+            if vals.size < 5:
+                return
+            lo = np.percentile(vals, lower)
+            hi = np.percentile(vals, upper)
+            if hi <= lo:
+                return
+            pad = 0.05 * (hi - lo)
+            ax.set_ylim(lo - pad, hi + pad)
+
         if plot_every > 0 and (episode_idx + 1) % plot_every == 0:
             fig, axes = plt.subplots(4, 2, figsize=(12, 16), sharex=True)
             x = np.arange(len(reward_hist))
@@ -362,6 +373,7 @@ def train(cfg):
             axes[0, 0].set_xlabel("Episode")
             axes[0, 0].set_ylabel("Scaled Reward")
             axes[0, 0].legend()
+            apply_ylim(axes[0, 0], reward_hist)
 
             tstt_mean_smooth = smooth_series(tstt_mean_hist, smooth_window)
             axes[0, 1].plot(x, tstt_mean_hist, color="#2ca02c", label="TSTT Mean")
@@ -370,6 +382,7 @@ def train(cfg):
             axes[0, 1].set_xlabel("Episode")
             axes[0, 1].set_ylabel("TSTT")
             axes[0, 1].legend()
+            apply_ylim(axes[0, 1], tstt_mean_hist)
 
             tstt_auc_smooth = smooth_series(tstt_auc_hist, smooth_window)
             axes[1, 0].plot(x, tstt_auc_hist, color="#9467bd", label="TSTT AUC")
@@ -378,6 +391,7 @@ def train(cfg):
             axes[1, 0].set_xlabel("Episode")
             axes[1, 0].set_ylabel("AUC")
             axes[1, 0].legend()
+            apply_ylim(axes[1, 0], tstt_auc_hist)
 
             critic_vals = [v if v is not None else np.nan for v in critic_hist]
             critic_smooth = smooth_series(critic_vals, smooth_window)
@@ -405,6 +419,7 @@ def train(cfg):
             axes[2, 1].set_xlabel("Episode")
             axes[2, 1].set_ylabel("TSTT")
             axes[2, 1].legend()
+            apply_ylim(axes[2, 1], tstt_last_vals)
 
             alpha_loss_vals = [v if v is not None else np.nan for v in alpha_loss_hist]
             alpha_loss_smooth = smooth_series(alpha_loss_vals, smooth_window)
@@ -429,7 +444,26 @@ def train(cfg):
             fig.tight_layout()
             fig.savefig(fig_path, dpi=200)
             plt.close(fig)
-    num_workers = int(cfg.get("num_workers", 0))
+    def resolve_worker_settings(cfg):
+        cpu_count = os.cpu_count() or 1
+        raw_workers = cfg.get("num_workers", 0)
+        if isinstance(raw_workers, str) and raw_workers.lower() == "auto":
+            num_workers = max(1, min(16, cpu_count - 2))
+        else:
+            num_workers = int(raw_workers)
+            if num_workers <= 0:
+                num_workers = max(1, min(16, cpu_count - 2))
+
+        raw_steps = cfg.get("rollout_steps_per_worker", 0)
+        if isinstance(raw_steps, str) and raw_steps.lower() == "auto":
+            rollout_steps = max(2, min(20, 256 // max(1, num_workers)))
+        else:
+            rollout_steps = int(raw_steps) if raw_steps else 0
+            if rollout_steps <= 0:
+                rollout_steps = max(2, min(20, 256 // max(1, num_workers)))
+        return num_workers, rollout_steps
+
+    num_workers, rollout_steps = resolve_worker_settings(cfg)
     if num_workers > 0:
         ctx = mp.get_context("spawn")
         queue_size = int(cfg.get("queue_size", 10000))
@@ -441,6 +475,7 @@ def train(cfg):
         for i in range(num_workers):
             wq = ctx.Queue(maxsize=1)
             wq.put(agent.actor.state_dict())
+            cfg["rollout_steps_per_worker"] = rollout_steps
             p = ctx.Process(target=rollout_worker, args=(i, cfg, wq, out_queue, stop_event))
             p.daemon = True
             p.start()
@@ -454,6 +489,7 @@ def train(cfg):
         global_steps = 0
         last_losses = {}
 
+        pbar = tqdm(total=cfg["episodes"])
         while episodes_done < cfg["episodes"]:
             try:
                 msg = out_queue.get(timeout=1.0)
@@ -493,6 +529,8 @@ def train(cfg):
                     for _ in range(updates_per_step):
                         bs = min(cfg["batch_size"], replay.size)
                         batch_items, indices, weights = replay.sample(bs)
+                        if any(item is None for item in batch_items):
+                            continue
                         states = []
                         next_states = []
                         actions = []
@@ -560,7 +598,7 @@ def train(cfg):
                         replay.update_priorities(indices, last_losses.get("td_errors", []))
 
                 if weights_sync_every > 0 and (global_steps % weights_sync_every == 0):
-                    weights = agent.actor.state_dict()
+                    weights = {k: v.detach().cpu() for k, v in agent.actor.state_dict().items()}
                     for wq in weights_queues:
                         try:
                             while True:
@@ -584,7 +622,9 @@ def train(cfg):
                     worker_rewards[wid] = 0.0
                     worker_tstt[wid] = []
                     episodes_done += 1
+                    pbar.update(1)
 
+        pbar.close()
         stop_event.set()
         for p in workers:
             p.join(timeout=2.0)
@@ -631,7 +671,9 @@ def train(cfg):
                 if replay.size > cfg["batch_start"] and (steps % update_every == 0):
                     for _ in range(updates_per_step):
                         bs = min(cfg["batch_size"], replay.size)
-                        batch_items, indices, weights = replay.sample(bs)
+                    batch_items, indices, weights = replay.sample(bs)
+                    if any(item is None for item in batch_items):
+                        continue
                         states = []
                         next_states = []
                         actions = []
