@@ -484,6 +484,7 @@ def train(cfg):
                 color="#1f9bff",
                 marker="o",
                 markersize=3,
+                linestyle="-",
                 label="Eval TSTT",
             )
             axes[4, 0].set_title("Eval TSTT")
@@ -1007,6 +1008,7 @@ def train(cfg):
             color="#1f9bff",
             marker="o",
             markersize=3,
+            linestyle="-",
             label="Eval TSTT",
         )
         axes[4, 0].set_title("Eval TSTT")

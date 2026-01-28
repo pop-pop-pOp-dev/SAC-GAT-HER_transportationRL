@@ -50,7 +50,7 @@ seed: 42
 eval_seeds: [43]
 model_path: /root/autodl-tmp/resilence/outputs/baselines_eval/no_model.pt
 use_torch_bpr: true
-device: cpu
+device: cuda
 graphml_path: ./maps_simu/sioux_falls.graphml
 alpha_max: 1.0
 save_best: true
