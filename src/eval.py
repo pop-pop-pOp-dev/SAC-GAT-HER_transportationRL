@@ -12,8 +12,6 @@ from src.baselines import get_baseline_policies, run_episode
 from src.data.tntp_download import download_sioux_falls
 from src.data.tntp_parser import load_graph_data
 from src.env.repair_env import RepairEnv
-from src.rl.sac import DiscreteSAC
-from src.train import to_torch
 
 
 def evaluate(cfg):
@@ -60,6 +58,9 @@ def evaluate(cfg):
             results[name] = result
 
         if model_path and os.path.exists(model_path):
+            from src.rl.sac import DiscreteSAC
+            from src.train import to_torch
+
             device = torch.device(cfg.get("device", "cpu"))
             agent = DiscreteSAC(
                 node_in=3,
