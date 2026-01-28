@@ -53,7 +53,7 @@ critic_lr: 0.0005
 alpha_lr: 0.0001
 gamma: 0.99
 target_tau: 0.001
-grad_clip: 0.5
+grad_clip: 1.0
 share_critic_encoder: false
 seed: 42
 eval_seeds: [43, 44, 45, 46, 47, 48, 49, 50, 51, 52]

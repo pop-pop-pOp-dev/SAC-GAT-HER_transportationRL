@@ -518,6 +518,13 @@ def train(cfg):
             fig.savefig(fig_path, dpi=200)
             plt.close(fig)
 
+    def save_checkpoint(episode_idx: int) -> None:
+        last_path = os.path.join(model_dir, "model_last.pt")
+        agent.save(last_path)
+        if (episode_idx + 1) % 20 == 0:
+            ckpt_path = os.path.join(model_dir, f"model_ep{episode_idx + 1}.pt")
+            agent.save(ckpt_path)
+
     def run_eval(episode_idx):
         nonlocal best_eval_tstt
         agent.actor.eval()
@@ -804,6 +811,7 @@ def train(cfg):
                         next_tstt,
                         worker_last_delta[wid],
                     )
+                    save_checkpoint(episodes_done)
                     worker_rewards[wid] = 0.0
                     worker_tstt[wid] = []
                     episodes_done += 1
@@ -928,6 +936,7 @@ def train(cfg):
                         replay.update_priorities(indices, last_losses.get("td_errors", []))
 
             record_episode(episode, episode_reward, episode_tstt, last_losses, env.tstt, delta_tstt)
+            save_checkpoint(episode)
             if eval_every > 0 and (episode + 1) % eval_every == 0:
                 run_eval(episode + 1)
 
