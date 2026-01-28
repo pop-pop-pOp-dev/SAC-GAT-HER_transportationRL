@@ -388,6 +388,7 @@ class RepairEnv:
                 bw_vec,
                 np.full(self.num_nodes, remaining_ratio, dtype=np.float32),
                 np.full(self.num_nodes, avg_flow_norm, dtype=np.float32),
+                np.full(self.num_nodes, log_tstt_val, dtype=np.float32),
             ],
             axis=1,
         )

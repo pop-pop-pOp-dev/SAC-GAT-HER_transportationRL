@@ -62,9 +62,12 @@ def evaluate(cfg):
             from src.train import to_torch
 
             device = torch.device(cfg.get("device", "cpu"))
+            sample_state = env.get_state()
+            node_in = sample_state.node_features.shape[1]
+            edge_in = sample_state.edge_features.shape[1]
             agent = DiscreteSAC(
-                node_in=3,
-                edge_in=6,
+                node_in=node_in,
+                edge_in=edge_in,
                 hidden=cfg["hidden_dim"],
                 embed=cfg["embed_dim"],
                 num_layers=cfg.get("gat_layers", 3),

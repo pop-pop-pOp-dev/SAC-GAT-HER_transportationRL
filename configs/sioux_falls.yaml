@@ -22,8 +22,8 @@ batch_size: 1024
 per_alpha: 0.6
 per_beta: 0.4
 per_eps: 1.0e-6
-reward_scale: 1.0
-reward_mode: log_delta
+reward_scale: 0.1
+reward_mode: rel_improve
 reward_alpha: 10.0
 reward_beta: 10.0
 reward_gamma: 0.01
@@ -36,12 +36,14 @@ max_steps: 150
 her_ratio: 0.0
 gat_layers: 3
 plot_every: 1
+plot_clip_percentile: 99
+eval_every: 100
 hidden_dim: 256
 embed_dim: 256
 lr: 0.0003
 actor_lr: 0.0001
 critic_lr: 0.0003
-alpha_lr: 0.00003
+alpha_lr: 0.0001
 gamma: 0.99
 target_tau: 0.001
 grad_clip: 0.5

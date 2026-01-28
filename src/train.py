@@ -297,8 +297,11 @@ def train(cfg):
     updates_per_step = int(cfg.get("updates_per_step", 1))
     alpha_max = cfg.get("alpha_max")
     save_best = bool(cfg.get("save_best", True))
-    best_auc = float("inf")
+    best_eval_tstt = float("inf")
+    eval_every = int(cfg.get("eval_every", 50))
+    eval_seeds = cfg.get("eval_seeds") or [1001, 1002, 1003, 1004, 1005]
     smooth_window = int(cfg.get("smooth_window", 10))
+    plot_clip_percentile = float(cfg.get("plot_clip_percentile", 99.0))
 
     def smooth_series(values, window):
         if window <= 1:
@@ -318,8 +321,20 @@ def train(cfg):
         smoothed[denom == 0] = np.nan
         return smoothed
 
+    def clip_series(values, lower=1.0, upper=99.0):
+        arr = np.asarray(values, dtype=np.float32)
+        if arr.size == 0:
+            return arr
+        vals = arr[np.isfinite(arr)]
+        if vals.size < 5:
+            return arr
+        lo = np.percentile(vals, lower)
+        hi = np.percentile(vals, upper)
+        if hi <= lo:
+            return arr
+        return np.clip(arr, lo, hi)
+
     def record_episode(episode_idx, episode_reward, episode_tstt, last_losses, last_tstt, delta_tstt):
-        nonlocal best_auc
         tstt_mean = float(np.mean(episode_tstt)) if episode_tstt else last_tstt
         tstt_auc = float(np.trapezoid(episode_tstt)) if episode_tstt else last_tstt
         metrics.append(
@@ -331,10 +346,6 @@ def train(cfg):
                 "tstt_auc": tstt_auc,
             }
         )
-        if save_best and tstt_auc < best_auc:
-            best_auc = tstt_auc
-            best_path = os.path.join(model_dir, "model_best.pt")
-            agent.save(best_path)
         writer.add_scalar("train/delta_tstt", delta_tstt, episode_idx)
         reward_hist.append(episode_reward)
         tstt_mean_hist.append(tstt_mean)
@@ -366,32 +377,35 @@ def train(cfg):
         if plot_every > 0 and (episode_idx + 1) % plot_every == 0:
             fig, axes = plt.subplots(4, 2, figsize=(12, 16), sharex=True)
             x = np.arange(len(reward_hist))
-            reward_smooth = smooth_series(reward_hist, smooth_window)
-            axes[0, 0].plot(x, reward_hist, color="#1f77b4", label="Reward")
+            reward_plot = clip_series(reward_hist, upper=plot_clip_percentile)
+            reward_smooth = smooth_series(reward_plot, smooth_window)
+            axes[0, 0].plot(x, reward_plot, color="#1f77b4", label="Reward")
             axes[0, 0].plot(x, reward_smooth, color="#00e5ff", linestyle="--", label="Reward (smoothed)")
             axes[0, 0].set_title("Reward")
             axes[0, 0].set_xlabel("Episode")
             axes[0, 0].set_ylabel("Scaled Reward")
             axes[0, 0].legend()
-            apply_ylim(axes[0, 0], reward_hist)
+            apply_ylim(axes[0, 0], reward_plot)
 
-            tstt_mean_smooth = smooth_series(tstt_mean_hist, smooth_window)
-            axes[0, 1].plot(x, tstt_mean_hist, color="#2ca02c", label="TSTT Mean")
+            tstt_mean_plot = clip_series(tstt_mean_hist, upper=plot_clip_percentile)
+            tstt_mean_smooth = smooth_series(tstt_mean_plot, smooth_window)
+            axes[0, 1].plot(x, tstt_mean_plot, color="#2ca02c", label="TSTT Mean")
             axes[0, 1].plot(x, tstt_mean_smooth, color="#00ff4f", linestyle="--", label="TSTT Mean (smoothed)")
             axes[0, 1].set_title("TSTT Mean")
             axes[0, 1].set_xlabel("Episode")
             axes[0, 1].set_ylabel("TSTT")
             axes[0, 1].legend()
-            apply_ylim(axes[0, 1], tstt_mean_hist)
+            apply_ylim(axes[0, 1], tstt_mean_plot)
 
-            tstt_auc_smooth = smooth_series(tstt_auc_hist, smooth_window)
-            axes[1, 0].plot(x, tstt_auc_hist, color="#9467bd", label="TSTT AUC")
+            tstt_auc_plot = clip_series(tstt_auc_hist, upper=plot_clip_percentile)
+            tstt_auc_smooth = smooth_series(tstt_auc_plot, smooth_window)
+            axes[1, 0].plot(x, tstt_auc_plot, color="#9467bd", label="TSTT AUC")
             axes[1, 0].plot(x, tstt_auc_smooth, color="#ff00ff", linestyle="--", label="TSTT AUC (smoothed)")
             axes[1, 0].set_title("TSTT AUC")
             axes[1, 0].set_xlabel("Episode")
             axes[1, 0].set_ylabel("AUC")
             axes[1, 0].legend()
-            apply_ylim(axes[1, 0], tstt_auc_hist)
+            apply_ylim(axes[1, 0], tstt_auc_plot)
 
             critic_vals = [v if v is not None else np.nan for v in critic_hist]
             critic_smooth = smooth_series(critic_vals, smooth_window)
@@ -412,14 +426,15 @@ def train(cfg):
             axes[2, 0].legend()
 
             tstt_last_vals = [m["tstt_last"] for m in metrics]
-            tstt_last_smooth = smooth_series(tstt_last_vals, smooth_window)
-            axes[2, 1].plot(x, tstt_last_vals, color="#8c564b", label="TSTT Last")
+            tstt_last_plot = clip_series(tstt_last_vals, upper=plot_clip_percentile)
+            tstt_last_smooth = smooth_series(tstt_last_plot, smooth_window)
+            axes[2, 1].plot(x, tstt_last_plot, color="#8c564b", label="TSTT Last")
             axes[2, 1].plot(x, tstt_last_smooth, color="#ff00a8", linestyle="--", label="TSTT Last (smoothed)")
             axes[2, 1].set_title("TSTT Last (Episode End)")
             axes[2, 1].set_xlabel("Episode")
             axes[2, 1].set_ylabel("TSTT")
             axes[2, 1].legend()
-            apply_ylim(axes[2, 1], tstt_last_vals)
+            apply_ylim(axes[2, 1], tstt_last_plot)
 
             alpha_loss_vals = [v if v is not None else np.nan for v in alpha_loss_hist]
             alpha_loss_smooth = smooth_series(alpha_loss_vals, smooth_window)
@@ -444,6 +459,63 @@ def train(cfg):
             fig.tight_layout()
             fig.savefig(fig_path, dpi=200)
             plt.close(fig)
+
+    def run_eval(episode_idx):
+        nonlocal best_eval_tstt
+        agent.actor.eval()
+        eval_rewards = []
+        eval_tstt = []
+        eval_auc = []
+        for seed in eval_seeds:
+            eval_env = RepairEnv(
+                graph,
+                damaged_ratio=cfg["damaged_ratio"],
+                assignment_iters=cfg["assignment_iters"],
+                assignment_method=cfg.get("assignment_method", "msa"),
+                use_cugraph=cfg.get("use_cugraph", False),
+                use_torch=cfg.get("use_torch_bpr", False),
+                device=str(device),
+                reward_mode=cfg.get("reward_mode", "delta"),
+                reward_alpha=cfg.get("reward_alpha", 1.0),
+                reward_beta=cfg.get("reward_beta", 10.0),
+                reward_gamma=cfg.get("reward_gamma", 0.1),
+                reward_clip=cfg.get("reward_clip", 0.0),
+                capacity_damage=cfg.get("capacity_damage", 1e-3),
+                unassigned_penalty=cfg.get("unassigned_penalty", 2e7),
+                seed=seed,
+            )
+            state = eval_env.reset(damaged_ratio=cfg["damaged_ratio"])
+            done = False
+            steps = 0
+            total_reward = 0.0
+            tstt_curve = []
+            while not done:
+                node_x, edge_index, edge_attr, action_mask = to_torch(state, device)
+                with torch.no_grad():
+                    out = agent.select_action(node_x, edge_index, edge_attr, action_mask, deterministic=True)
+                state, reward, done, info = eval_env.step(out.action)
+                total_reward += reward * reward_scale
+                tstt_curve.append(info.get("tstt", eval_env.tstt))
+                steps += 1
+                if max_steps > 0 and steps >= max_steps and not done:
+                    break
+            eval_rewards.append(total_reward)
+            eval_tstt.append(float(tstt_curve[-1]) if tstt_curve else eval_env.tstt)
+            eval_auc.append(float(np.trapezoid(tstt_curve)) if tstt_curve else eval_env.tstt)
+
+        avg_reward = float(np.mean(eval_rewards))
+        avg_tstt = float(np.mean(eval_tstt))
+        avg_auc = float(np.mean(eval_auc))
+        writer.add_scalar("eval/avg_reward", avg_reward, episode_idx)
+        writer.add_scalar("eval/avg_tstt", avg_tstt, episode_idx)
+        writer.add_scalar("eval/avg_auc", avg_auc, episode_idx)
+
+        if save_best and avg_tstt < best_eval_tstt:
+            best_eval_tstt = avg_tstt
+            best_path = os.path.join(model_dir, "model_best_eval.pt")
+            agent.save(best_path)
+
+        agent.actor.train()
     def resolve_worker_settings(cfg):
         cpu_count = os.cpu_count() or 1
         raw_workers = cfg.get("num_workers", 0)
@@ -623,6 +695,8 @@ def train(cfg):
                     worker_tstt[wid] = []
                     episodes_done += 1
                     pbar.update(1)
+                    if eval_every > 0 and episodes_done % eval_every == 0:
+                        run_eval(episodes_done)
 
         pbar.close()
         stop_event.set()
@@ -741,6 +815,8 @@ def train(cfg):
                         replay.update_priorities(indices, last_losses.get("td_errors", []))
 
             record_episode(episode, episode_reward, episode_tstt, last_losses, env.tstt, delta_tstt)
+            if eval_every > 0 and (episode + 1) % eval_every == 0:
+                run_eval(episode + 1)
 
     out_path = os.path.join(cfg["output_dir"], "train_metrics.npy")
     np.save(out_path, metrics)
