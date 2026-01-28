@@ -178,6 +178,8 @@ class RepairEnv:
         self.capacities[damaged_indices] = self.capacity_damage
         self.goal_mask = self.is_damaged.copy()
         self.flow = np.zeros(self.num_edges, dtype=np.float32)
+        self.od_paths = {}
+        self.od_path_flows = {}
         self.tstt = None
         self.compute_flow_assignment()
         self.initial_tstt = self.tstt
@@ -257,6 +259,9 @@ class RepairEnv:
             raise ValueError("assignment_iters must be > 0 to update TSTT.")
         if self.flow is None or self.is_reset:
             self.flow = np.zeros(self.num_edges, dtype=np.float32)
+        if self.assignment_method == "gp":
+            self._compute_flow_assignment_gp()
+            return
         t = self.compute_travel_time(self.flow)
 
         for it in range(self.assignment_iters):
@@ -268,6 +273,68 @@ class RepairEnv:
             self.flow = (1 - step) * self.flow + step * aux_flow
             t = self.compute_travel_time(self.flow)
             self.unassigned_demand = unassigned
+
+        self.tstt = self.compute_tstt(self.flow, t, self.unassigned_demand)
+
+    def _path_cost(self, path_edges: Tuple[int, ...], t: np.ndarray) -> float:
+        if not path_edges:
+            return float("inf")
+        return float(np.sum(t[list(path_edges)]))
+
+    def _compute_flow_assignment_gp(self):
+        t = self.compute_travel_time(self.flow)
+        if self.is_reset or not self.od_paths:
+            self.od_paths = {}
+            self.od_path_flows = {}
+
+        for it in range(self.assignment_iters):
+            unassigned = 0.0
+            step = 1.0 / (it + 1.0)
+            for origin in range(self.num_nodes):
+                dests = [d for (o, d) in self.graph_data.od_demand.keys() if o - 1 == origin]
+                if not dests:
+                    continue
+                paths_dict = self._shortest_paths_from_origin(origin, t)
+                for dest in dests:
+                    demand = self.graph_data.od_demand[(origin + 1, dest)]
+                    sp_edges = paths_dict.get(dest - 1, [])
+                    if not sp_edges:
+                        unassigned += demand
+                        continue
+                    key = (origin + 1, dest)
+                    sp_tuple = tuple(sp_edges)
+                    if key not in self.od_paths:
+                        self.od_paths[key] = [sp_tuple]
+                        self.od_path_flows[key] = [float(demand)]
+                        continue
+                    if sp_tuple not in self.od_paths[key]:
+                        self.od_paths[key].append(sp_tuple)
+                        self.od_path_flows[key].append(0.0)
+                    costs = [self._path_cost(p, t) for p in self.od_paths[key]]
+                    min_idx = int(np.argmin(costs))
+                    flows = self.od_path_flows[key]
+                    if len(flows) > 1:
+                        moved = 0.0
+                        for i in range(len(flows)):
+                            if i == min_idx:
+                                continue
+                            transfer = step * flows[i]
+                            flows[i] -= transfer
+                            moved += transfer
+                        flows[min_idx] += moved
+
+            flow = np.zeros(self.num_edges, dtype=np.float32)
+            for key, paths in self.od_paths.items():
+                flows = self.od_path_flows[key]
+                for p, f in zip(paths, flows):
+                    if f <= 0:
+                        continue
+                    for e_id in p:
+                        flow[e_id] += f
+
+            self.flow = flow
+            self.unassigned_demand = unassigned
+            t = self.compute_travel_time(self.flow)
 
         self.tstt = self.compute_tstt(self.flow, t, self.unassigned_demand)
 

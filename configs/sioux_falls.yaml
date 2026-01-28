@@ -7,7 +7,7 @@ assignment_iters: 50
 assignment_iters_start: 20
 assignment_iters_end: 120
 assignment_iters_warmup_episodes: 2000
-assignment_method: fw
+assignment_method: gp
 use_cugraph: false
 sp_backend: torch
 force_gpu_sp: true
@@ -20,13 +20,13 @@ num_workers: 20
 rollout_steps_per_worker: 20
 queue_size: 10000
 weights_sync_every: 200
-batch_size: 256
+batch_size: 512
 per_alpha: 0.6
 per_beta: 0.4
 per_eps: 1.0e-6
 reward_scale: 0.05
 reward_mode: rel_improve
-reward_alpha: 10.0
+reward_alpha: 2.0
 reward_beta: 10.0
 reward_gamma: 0.01
 reward_clip: 50.0
@@ -47,12 +47,12 @@ hidden_dim: 256
 embed_dim: 256
 lr: 0.0003
 actor_lr: 0.00005
-critic_lr: 0.0003
+critic_lr: 0.0005
 alpha_lr: 0.0001
 gamma: 0.99
 target_tau: 0.001
 grad_clip: 0.5
-share_critic_encoder: true
+share_critic_encoder: false
 seed: 42
 eval_seeds: [43, 44, 45, 46, 47, 48, 49, 50, 51, 52]
 model_path: ./outputs/model.pt
