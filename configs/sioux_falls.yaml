@@ -2,12 +2,12 @@ data_dir: ./data
 output_dir: /root/autodl-tmp/resilence/outputs
 model_dir: /root/autodl-tmp/resilence/outputs
 damaged_ratio: 0.3
-assignment_iters: 50
+assignment_iters: 20
 # Optional schedule (uncomment/tune if needed):
 assignment_iters_start: 20
 assignment_iters_end: 120
 assignment_iters_warmup_episodes: 2000
-assignment_method: gp
+assignment_method: cfw
 use_cugraph: false
 sp_backend: torch
 force_gpu_sp: true
@@ -30,6 +30,8 @@ reward_alpha: 2.0
 reward_beta: 10.0
 reward_gamma: 0.01
 reward_clip: 50.0
+gp_step: 1.0
+gp_keep_paths: 2
 capacity_damage: 1.0e-3
 unassigned_penalty: 1.0e4
 debug_reward: false

@@ -40,6 +40,8 @@ class RepairEnv:
         reward_clip: float = 0.0,
         capacity_damage: float = 1e-3,
         unassigned_penalty: float = 2e7,
+        gp_step: float = 1.0,
+        gp_keep_paths: int = 3,
         debug_reward: bool = False,
         debug_reward_every: int = 0,
         seed: int = 0,
@@ -65,6 +67,8 @@ class RepairEnv:
         self.reward_clip = reward_clip
         self.capacity_damage = capacity_damage
         self.unassigned_penalty = unassigned_penalty
+        self.gp_step = float(gp_step)
+        self.gp_keep_paths = int(gp_keep_paths)
         self.debug_reward = debug_reward
         self.debug_reward_every = debug_reward_every
         self._debug_step = 0
@@ -263,14 +267,27 @@ class RepairEnv:
             self._compute_flow_assignment_gp()
             return
         t = self.compute_travel_time(self.flow)
-
+        d_prev = None
         for it in range(self.assignment_iters):
             aux_flow, unassigned = self._all_or_nothing(t)
-            if self.assignment_method == "fw":
+            d_fw = aux_flow - self.flow
+            if self.assignment_method == "cfw":
+                if d_prev is None:
+                    direction = d_fw
+                else:
+                    num = float(np.dot(d_fw, d_fw - d_prev))
+                    denom = float(np.dot(d_prev, d_prev)) + 1e-12
+                    beta = max(0.0, num / denom)
+                    direction = d_fw + beta * d_prev
                 step = 2.0 / (it + 2.0)
+                self.flow = np.maximum(self.flow + step * direction, 0.0)
+                d_prev = direction
             else:
-                step = 1.0 / (it + 1.0)
-            self.flow = (1 - step) * self.flow + step * aux_flow
+                if self.assignment_method == "fw":
+                    step = 2.0 / (it + 2.0)
+                else:
+                    step = 1.0 / (it + 1.0)
+                self.flow = (1 - step) * self.flow + step * aux_flow
             t = self.compute_travel_time(self.flow)
             self.unassigned_demand = unassigned
 
@@ -289,7 +306,7 @@ class RepairEnv:
 
         for it in range(self.assignment_iters):
             unassigned = 0.0
-            step = 1.0 / (it + 1.0)
+            step = self.gp_step if self.gp_step > 0 else (1.0 / (it + 1.0))
             for origin in range(self.num_nodes):
                 dests = [d for (o, d) in self.graph_data.od_demand.keys() if o - 1 == origin]
                 if not dests:
@@ -322,6 +339,18 @@ class RepairEnv:
                             flows[i] -= transfer
                             moved += transfer
                         flows[min_idx] += moved
+                    if self.gp_keep_paths > 0 and len(self.od_paths[key]) > self.gp_keep_paths:
+                        keep = np.argsort(costs)[: self.gp_keep_paths]
+                        new_paths = [self.od_paths[key][i] for i in keep]
+                        new_flows = [flows[i] for i in keep]
+                        total = float(np.sum(new_flows))
+                        if total > 0:
+                            new_flows = [f * demand / total for f in new_flows]
+                        else:
+                            new_flows = [0.0 for _ in new_flows]
+                            new_flows[0] = float(demand)
+                        self.od_paths[key] = new_paths
+                        self.od_path_flows[key] = new_flows
 
             flow = np.zeros(self.num_edges, dtype=np.float32)
             for key, paths in self.od_paths.items():
