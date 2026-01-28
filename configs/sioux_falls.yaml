@@ -24,9 +24,9 @@ batch_size: 512
 per_alpha: 0.6
 per_beta: 0.4
 per_eps: 1.0e-6
-reward_scale: 0.05
+reward_scale: 1.0
 reward_mode: minimize_tstt
-reward_alpha: 2.0
+reward_alpha: 5.0
 reward_beta: 10.0
 reward_gamma: 0.01
 reward_clip: 50.0
