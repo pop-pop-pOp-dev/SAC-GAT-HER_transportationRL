@@ -479,16 +479,31 @@ def train(cfg):
             axes[3, 1].legend()
             apply_ylim(axes[3, 1], entropy_vals)
 
-            eval_tstt_vals = [v if v is not None and np.isfinite(v) else np.nan for v in eval_tstt_hist]
-            axes[4, 0].plot(
-                x,
-                eval_tstt_vals,
-                color="#1f9bff",
-                marker="o",
-                markersize=3,
-                linestyle="-",
-                label="Eval TSTT",
+            eval_tstt_vals = np.asarray(
+                [v if v is not None and np.isfinite(v) else np.nan for v in eval_tstt_hist],
+                dtype=np.float32,
             )
+            eval_idx = np.where(np.isfinite(eval_tstt_vals))[0]
+            if eval_idx.size > 0:
+                eval_x = x[eval_idx]
+                eval_y = eval_tstt_vals[eval_idx]
+                eval_smooth = smooth_series(eval_y, smooth_window)
+                axes[4, 0].plot(
+                    eval_x,
+                    eval_y,
+                    color="#1f9bff",
+                    marker="o",
+                    markersize=3,
+                    linestyle="-",
+                    label="Eval TSTT",
+                )
+                axes[4, 0].plot(
+                    eval_x,
+                    eval_smooth,
+                    color="#00e5ff",
+                    linestyle="--",
+                    label="Eval TSTT (smoothed)",
+                )
             axes[4, 0].set_title("Eval TSTT")
             axes[4, 0].set_xlabel("Episode")
             axes[4, 0].set_ylabel("TSTT")
@@ -1005,16 +1020,31 @@ def train(cfg):
         axes[3, 1].legend()
         apply_ylim(axes[3, 1], entropy_vals)
 
-        eval_tstt_vals = [v if v is not None and np.isfinite(v) else np.nan for v in eval_tstt_hist]
-        axes[4, 0].plot(
-            x,
-            eval_tstt_vals,
-            color="#1f9bff",
-            marker="o",
-            markersize=3,
-            linestyle="-",
-            label="Eval TSTT",
+        eval_tstt_vals = np.asarray(
+            [v if v is not None and np.isfinite(v) else np.nan for v in eval_tstt_hist],
+            dtype=np.float32,
         )
+        eval_idx = np.where(np.isfinite(eval_tstt_vals))[0]
+        if eval_idx.size > 0:
+            eval_x = x[eval_idx]
+            eval_y = eval_tstt_vals[eval_idx]
+            eval_smooth = smooth_series(eval_y, smooth_window)
+            axes[4, 0].plot(
+                eval_x,
+                eval_y,
+                color="#1f9bff",
+                marker="o",
+                markersize=3,
+                linestyle="-",
+                label="Eval TSTT",
+            )
+            axes[4, 0].plot(
+                eval_x,
+                eval_smooth,
+                color="#00e5ff",
+                linestyle="--",
+                label="Eval TSTT (smoothed)",
+            )
         axes[4, 0].set_title("Eval TSTT")
         axes[4, 0].set_xlabel("Episode")
         axes[4, 0].set_ylabel("TSTT")

@@ -241,6 +241,9 @@ class RepairEnv:
             delta = -curr_tstt
         elif mode == "log_delta":
             delta = np.log10(max(prev_tstt, 1.0)) - np.log10(max(curr_tstt, 1.0))
+        elif mode == "minimize_tstt":
+            base = self.initial_tstt if self.initial_tstt is not None else prev_tstt
+            delta = 1.0 - (curr_tstt / max(base, 1.0))
         elif mode == "rel_improve":
             base = self.initial_tstt if self.initial_tstt is not None else prev_tstt
             delta = ((prev_tstt - curr_tstt) / max(base, 1.0)) * 100.0
