@@ -11,3 +11,5 @@ torchaudio
 torch-geometric
 requests
 tensorboard
+gymnasium
+ray[rllib]

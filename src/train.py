@@ -293,6 +293,8 @@ def train(cfg):
     model_dir = cfg.get("model_dir", cfg["output_dir"])
     os.makedirs(model_dir, exist_ok=True)
     fig_path = os.path.join(cfg["output_dir"], "train_curves.png")
+    tb_pics_dir = os.path.join(os.getcwd(), "tb_pics")
+    os.makedirs(tb_pics_dir, exist_ok=True)
     plot_every = int(cfg.get("plot_every", 1))
     reward_scale = float(cfg.get("reward_scale", 1.0))
     reward_mode = str(cfg.get("reward_mode", "delta"))
@@ -388,6 +390,9 @@ def train(cfg):
             writer.add_scalar("train/alpha", last_losses.get("alpha", 0.0), episode_idx)
             writer.add_scalar("train/alpha_loss", last_losses.get("alpha_loss", 0.0), episode_idx)
             writer.add_scalar("train/policy_entropy", last_losses.get("policy_entropy", 0.0), episode_idx)
+            writer.add_scalar("train/q_taken", last_losses.get("q_taken", 0.0), episode_idx)
+            writer.add_scalar("train/q_mean", last_losses.get("q_mean", 0.0), episode_idx)
+            writer.add_scalar("train/logp_mean", last_losses.get("logp_mean", 0.0), episode_idx)
 
         if plot_every > 0 and (episode_idx + 1) % plot_every == 0:
             fig, axes = plt.subplots(5, 2, figsize=(12, 20), sharex=True)
@@ -516,6 +521,7 @@ def train(cfg):
                 ax.grid(True, alpha=0.3)
             fig.tight_layout()
             fig.savefig(fig_path, dpi=200)
+            fig.savefig(os.path.join(tb_pics_dir, f"train_curves_ep{episode_idx + 1}.png"), dpi=200)
             plt.close(fig)
 
     def save_checkpoint(episode_idx: int) -> None:
@@ -1066,6 +1072,7 @@ def train(cfg):
             ax.grid(True, alpha=0.3)
         fig.tight_layout()
         fig.savefig(fig_path, dpi=200)
+        fig.savefig(os.path.join(tb_pics_dir, "train_curves_final.png"), dpi=200)
         plt.close(fig)
     model_dir = cfg.get("model_dir", cfg["output_dir"])
     os.makedirs(model_dir, exist_ok=True)

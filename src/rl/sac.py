@@ -215,6 +215,8 @@ class DiscreteSAC:
         alpha_term = scatter_sum(probs.detach() * (log_probs + target_entropy), edge_batch, dim=0)
         alpha_loss = -(self.log_alpha * alpha_term).mean()
         entropy = scatter_sum(-(probs.detach() * log_probs), edge_batch, dim=0).mean()
+        q_taken = torch.min(q1, q2).detach()
+        logp_mean = scatter_sum(probs.detach() * log_probs, edge_batch, dim=0).mean().detach()
 
         self.critic_opt.zero_grad()
         critic_loss.backward()
@@ -254,6 +256,9 @@ class DiscreteSAC:
             "alpha": self.alpha.item(),
             "alpha_loss": alpha_loss.item(),
             "policy_entropy": entropy.item(),
+            "q_taken": q_taken.mean().item(),
+            "q_mean": q_all.mean().item(),
+            "logp_mean": logp_mean.item(),
             "td_errors": td_errors_list,
         }
 

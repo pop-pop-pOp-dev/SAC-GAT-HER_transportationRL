@@ -31,6 +31,8 @@ def evaluate(cfg):
         cfg["seed"] = int(seed_override)
         cfg["output_dir"] = os.path.join(cfg["output_dir"], f"seed_{cfg['seed']}")
         cfg["model_path"] = os.path.join(cfg["output_dir"], "model.pt")
+        model_dir = cfg.get("model_dir", cfg["output_dir"])
+        cfg["model_dir"] = os.path.join(model_dir, f"seed_{cfg['seed']}")
         eval_seeds = [cfg["seed"]]
     else:
         eval_seeds = cfg.get("eval_seeds")
@@ -44,6 +46,9 @@ def evaluate(cfg):
     reward_scale = float(cfg.get("reward_scale", 1.0))
     max_steps = int(cfg.get("max_steps", 0)) if cfg.get("max_steps", 0) is not None else 0
     all_results: Dict[str, Dict] = {}
+    eval_baselines = bool(cfg.get("eval_baselines", True))
+    rllib_algos = {"ppo", "a2c", "impala", "dqn", "rainbow"}
+    algo_name = str(cfg.get("algo", "")).lower()
     for seed in eval_seeds:
         print(f"[eval] Start seed {seed}")
         env = RepairEnv(
@@ -67,13 +72,14 @@ def evaluate(cfg):
         )
 
         results: Dict[str, Dict] = {}
-        baselines = get_baseline_policies(env)
-        for name, policy in baselines.items():
-            result = run_episode(env, policy, reward_scale=reward_scale, max_steps=max_steps)
-            results[name] = result
-            all_results[f"seed_{seed}"] = results
-            save_results(all_results, cfg["output_dir"])
-            print(f"[eval] Seed {seed} baseline {name} done")
+        if eval_baselines:
+            baselines = get_baseline_policies(env)
+            for name, policy in baselines.items():
+                result = run_episode(env, policy, reward_scale=reward_scale, max_steps=max_steps)
+                results[name] = result
+                all_results[f"seed_{seed}"] = results
+                save_results(all_results, cfg["output_dir"])
+                print(f"[eval] Seed {seed} baseline {name} done")
 
         if model_path and os.path.exists(model_path):
             from src.rl.sac import DiscreteSAC
@@ -124,6 +130,51 @@ def evaluate(cfg):
             all_results[f"seed_{seed}"] = results
             save_results(all_results, cfg["output_dir"])
             print(f"[eval] Seed {seed} baseline sac done")
+
+        if algo_name in rllib_algos:
+            from ray.rllib.models import ModelCatalog
+            from ray.rllib.algorithms.algorithm import Algorithm
+            from src.rl.rllib_env import RepairEnvGym
+            from src.rl.rllib_models import GATMaskedPolicyModel, GATMaskedQModel
+            from src.rl.rllib_utils import resolve_checkpoint, run_rllib_episode
+
+            ModelCatalog.register_custom_model("gat_masked_policy", GATMaskedPolicyModel)
+            ModelCatalog.register_custom_model("gat_masked_q", GATMaskedQModel)
+
+            model_dir = cfg.get("model_dir", cfg["output_dir"])
+            checkpoint_path = cfg.get("rllib_checkpoint") or resolve_checkpoint(model_dir)
+            if checkpoint_path and os.path.exists(checkpoint_path):
+                algo = Algorithm.from_checkpoint(checkpoint_path)
+                env_config = {
+                    "data_dir": cfg["data_dir"],
+                    "net_path": data_paths["net_path"],
+                    "trips_path": data_paths["trips_path"],
+                    "damaged_ratio": cfg["damaged_ratio"],
+                    "assignment_iters": cfg["assignment_iters"],
+                    "assignment_method": cfg.get("assignment_method", "msa"),
+                    "use_cugraph": cfg.get("use_cugraph", False),
+                    "use_torch_bpr": cfg.get("use_torch_bpr", False),
+                    "device": cfg.get("device", "cpu"),
+                    "sp_backend": cfg.get("sp_backend", "auto"),
+                    "force_gpu_sp": cfg.get("force_gpu_sp", False),
+                    "reward_mode": cfg.get("reward_mode", "log_delta"),
+                    "reward_alpha": cfg.get("reward_alpha", 1.0),
+                    "reward_beta": cfg.get("reward_beta", 10.0),
+                    "reward_gamma": cfg.get("reward_gamma", 0.1),
+                    "reward_clip": cfg.get("reward_clip", 0.0),
+                    "capacity_damage": cfg.get("capacity_damage", 1e-3),
+                    "unassigned_penalty": cfg.get("unassigned_penalty", 2e7),
+                    "reward_scale": reward_scale,
+                    "max_steps": max_steps,
+                    "seed": seed,
+                }
+                env_eval = RepairEnvGym(env_config)
+                results[algo_name] = run_rllib_episode(algo, env_eval)
+                all_results[f"seed_{seed}"] = results
+                save_results(all_results, cfg["output_dir"])
+                print(f"[eval] Seed {seed} baseline {algo_name} done")
+            else:
+                print(f"[eval] Skip {algo_name} - checkpoint not found in {model_dir}")
 
         all_results[f"seed_{seed}"] = results
         save_results(all_results, cfg["output_dir"])

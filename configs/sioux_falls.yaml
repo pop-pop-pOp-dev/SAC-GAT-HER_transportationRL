@@ -39,7 +39,7 @@ debug_reward_every: 0
 max_steps: 100
 her_ratio: 0.0
 gat_layers: 3
-plot_every: 1
+plot_every: 20
 plot_clip_percentile: 99
 plot_clip_percentile_mean: 95
 plot_clip_percentile_auc: 95
@@ -48,7 +48,7 @@ eval_every: 20
 hidden_dim: 256
 embed_dim: 256
 lr: 0.0003
-actor_lr: 0.00005
+actor_lr: 0.0002
 critic_lr: 0.0005
 alpha_lr: 0.0001
 gamma: 0.99
