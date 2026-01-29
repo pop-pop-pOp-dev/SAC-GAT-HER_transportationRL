@@ -238,6 +238,7 @@ class DiscreteSAC:
         self.alpha_opt.step()
         if alpha_max is not None:
             self.log_alpha.data.clamp_(max=float(np.log(alpha_max)))
+        self.log_alpha.data.clamp_(min=float(np.log(0.01)))
 
         if self.share_critic_encoder:
             self._soft_update(self.critic_encoder, self.target_encoder)

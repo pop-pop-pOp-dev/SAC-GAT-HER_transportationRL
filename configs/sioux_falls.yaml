@@ -1,6 +1,6 @@
 data_dir: ./data
 output_dir: /root/autodl-tmp/resilence/outputs
-model_dir: /root/autodl-tmp/resilence/outputs
+model_dir: /root/autodl-tmp/resilence/outputs/pt
 damaged_ratio: 0.3
 assignment_iters: 60
 # Optional schedule (uncomment/tune if needed):
@@ -11,7 +11,7 @@ assignment_method: cfw
 use_cugraph: false
 sp_backend: torch
 force_gpu_sp: true
-episodes: 5000
+episodes: 2000
 buffer_size: 1000000
 batch_start: 2000
 update_every: 2
@@ -24,7 +24,7 @@ batch_size: 512
 per_alpha: 0.6
 per_beta: 0.4
 per_eps: 1.0e-6
-reward_scale: 1.0
+reward_scale: 0.05
 reward_mode: minimize_tstt
 reward_alpha: 1.0
 reward_beta: 0.0
