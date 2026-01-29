@@ -3,6 +3,9 @@ from __future__ import annotations
 from typing import Any, Dict, Tuple
 
 import numpy as np
+
+if not hasattr(np, "product"):
+    np.product = np.prod
 import gymnasium as gym
 from gymnasium import spaces
 from ray.rllib.env.env_context import EnvContext

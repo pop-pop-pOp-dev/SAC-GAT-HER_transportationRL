@@ -11,10 +11,6 @@ import torch
 import yaml
 import ray
 from ray.rllib.models import ModelCatalog
-from ray.rllib.algorithms.ppo import PPOConfig
-from ray.rllib.algorithms.a2c import A2CConfig
-from ray.rllib.algorithms.impala import IMPALAConfig
-from ray.rllib.algorithms.dqn import DQNConfig
 
 from src.data.tntp_download import download_sioux_falls
 from src.data.tntp_parser import load_graph_data
@@ -46,9 +42,9 @@ def _resolve_model_config(cfg: Dict, graph) -> Dict:
         assignment_method=cfg.get("assignment_method", "msa"),
         use_cugraph=cfg.get("use_cugraph", False),
         use_torch=cfg.get("use_torch_bpr", False),
-        device=cfg.get("device", "cpu"),
-        sp_backend=cfg.get("sp_backend", "auto"),
-        force_gpu_sp=cfg.get("force_gpu_sp", False),
+        device=cfg.get("env_device", "cpu"),
+        sp_backend=cfg.get("env_sp_backend", cfg.get("sp_backend", "auto")),
+        force_gpu_sp=cfg.get("env_force_gpu_sp", False),
         reward_mode=cfg.get("reward_mode", "log_delta"),
         reward_alpha=cfg.get("reward_alpha", 1.0),
         reward_beta=cfg.get("reward_beta", 10.0),
@@ -77,10 +73,12 @@ def _register_models():
 def _build_algorithm(cfg: Dict, model_cfg: Dict, env_config: Dict):
     algo = str(cfg.get("algo", "ppo")).lower()
     num_workers = int(cfg.get("num_workers", 0))
-    rollout_fragment = int(cfg.get("rollout_fragment_length", cfg.get("max_steps", 0) or 50))
+    rollout_fragment = cfg.get("rollout_fragment_length", "auto")
     num_gpus = 1 if str(cfg.get("device", "cpu")).startswith("cuda") else 0
 
     if algo == "ppo":
+        from ray.rllib.algorithms.ppo import PPOConfig
+
         algo_config = (
             PPOConfig()
             .environment(env=RepairEnvGym, env_config=env_config)
@@ -97,6 +95,11 @@ def _build_algorithm(cfg: Dict, model_cfg: Dict, env_config: Dict):
             .resources(num_gpus=num_gpus)
         )
     elif algo == "a2c":
+        try:
+            from ray.rllib.algorithms.a2c import A2CConfig
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError("A2CConfig not available in this RLlib version.") from exc
+
         algo_config = (
             A2CConfig()
             .environment(env=RepairEnvGym, env_config=env_config)
@@ -110,6 +113,8 @@ def _build_algorithm(cfg: Dict, model_cfg: Dict, env_config: Dict):
             .resources(num_gpus=num_gpus)
         )
     elif algo == "impala":
+        from ray.rllib.algorithms.impala import IMPALAConfig
+
         algo_config = (
             IMPALAConfig()
             .environment(env=RepairEnvGym, env_config=env_config)
@@ -123,6 +128,8 @@ def _build_algorithm(cfg: Dict, model_cfg: Dict, env_config: Dict):
             .resources(num_gpus=num_gpus)
         )
     elif algo in {"dqn", "rainbow"}:
+        from ray.rllib.algorithms.dqn import DQNConfig
+
         enable_rainbow = algo == "rainbow"
         algo_config = (
             DQNConfig()
@@ -176,9 +183,9 @@ def train(cfg: Dict):
         "assignment_method": cfg.get("assignment_method", "msa"),
         "use_cugraph": cfg.get("use_cugraph", False),
         "use_torch_bpr": cfg.get("use_torch_bpr", False),
-        "device": cfg.get("device", "cpu"),
-        "sp_backend": cfg.get("sp_backend", "auto"),
-        "force_gpu_sp": cfg.get("force_gpu_sp", False),
+        "device": cfg.get("env_device", "cpu"),
+        "sp_backend": cfg.get("env_sp_backend", cfg.get("sp_backend", "auto")),
+        "force_gpu_sp": cfg.get("env_force_gpu_sp", False),
         "reward_mode": cfg.get("reward_mode", "log_delta"),
         "reward_alpha": cfg.get("reward_alpha", 1.0),
         "reward_beta": cfg.get("reward_beta", 10.0),

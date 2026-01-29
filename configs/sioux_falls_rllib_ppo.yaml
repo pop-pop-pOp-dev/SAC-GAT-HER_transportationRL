@@ -8,6 +8,9 @@ assignment_method: cfw
 use_cugraph: false
 sp_backend: torch
 force_gpu_sp: true
+env_device: cpu
+env_sp_backend: scipy
+env_force_gpu_sp: false
 episodes: 2000
 num_workers: 20
 reward_scale: 0.05

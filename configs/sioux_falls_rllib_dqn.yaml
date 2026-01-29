@@ -8,6 +8,9 @@ assignment_method: cfw
 use_cugraph: false
 sp_backend: torch
 force_gpu_sp: true
+env_device: cpu
+env_sp_backend: scipy
+env_force_gpu_sp: false
 episodes: 2000
 buffer_size: 1000000
 batch_start: 2000
