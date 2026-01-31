@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+
+# Training/eval artifacts
+outputs/
+outputs_smoke/
+outputs_history/
+tb_pics/
+baselines_results/
+history-data/
+history-results/
+

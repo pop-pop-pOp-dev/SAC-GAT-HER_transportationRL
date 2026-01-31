@@ -1,7 +1,7 @@
-algo: impala
+algo: appo
 data_dir: ./data
-output_dir: /root/autodl-tmp/resilence/outputs/baselines_eval/impala
-model_dir: /root/autodl-tmp/resilence/outputs/baselines_eval/impala
+output_dir: /root/autodl-tmp/resilence/outputs/baselines_eval/appo
+model_dir: /root/autodl-tmp/resilence/outputs/baselines_eval/appo
 damaged_ratio: 0.3
 assignment_iters: 60
 assignment_method: cfw

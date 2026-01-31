@@ -40,6 +40,11 @@ class RepairEnvGym(gym.Env):
         graph = _load_graph_from_config(cfg)
         self.reward_scale = float(cfg.get("reward_scale", 1.0))
         self.max_steps = int(cfg.get("max_steps", 0))
+        if self.max_steps == 0:
+            print(f"[RepairEnvGym] WARNING: max_steps is 0 (infinite). Config: {cfg.keys()}")
+        else:
+            print(f"[RepairEnvGym] initialized with max_steps={self.max_steps}")
+
         self.damaged_ratio = float(cfg.get("damaged_ratio", 0.3))
         self.env = RepairEnv(
             graph,
@@ -58,6 +63,8 @@ class RepairEnvGym(gym.Env):
             reward_clip=cfg.get("reward_clip", 0.0),
             capacity_damage=cfg.get("capacity_damage", 1e-3),
             unassigned_penalty=cfg.get("unassigned_penalty", 2e7),
+            fixed_damage=cfg.get("fixed_damage", False),
+            fixed_damage_seed=cfg.get("fixed_damage_seed"),
             seed=seed,
         )
 
@@ -112,15 +119,19 @@ class RepairEnvGym(gym.Env):
         if self.max_steps > 0 and self._steps >= self.max_steps and not done:
             truncated = True
         obs = self._state_to_obs(state)
-        return obs, reward, bool(done), bool(truncated), info
+        # Ensure done is True if truncated, so RLlib counts the episode as completed for metrics
+        return obs, reward, bool(done or truncated), bool(truncated), info
 
     def _state_to_obs(self, state):
+        node_features = np.nan_to_num(state.node_features, nan=0.0, posinf=0.0, neginf=0.0)
+        edge_features = np.nan_to_num(state.edge_features, nan=0.0, posinf=0.0, neginf=0.0)
+        action_mask = np.nan_to_num(state.action_mask, nan=0.0, posinf=0.0, neginf=0.0)
         return {
             "obs": {
-                "node_features": state.node_features.astype(np.float32),
-                "edge_features": state.edge_features.astype(np.float32),
+                "node_features": node_features.astype(np.float32),
+                "edge_features": edge_features.astype(np.float32),
             },
-            "action_mask": state.action_mask.astype(np.float32),
+            "action_mask": action_mask.astype(np.float32),
         }
 
     def render(self):

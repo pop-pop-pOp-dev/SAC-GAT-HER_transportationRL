@@ -47,7 +47,7 @@ def evaluate(cfg):
     max_steps = int(cfg.get("max_steps", 0)) if cfg.get("max_steps", 0) is not None else 0
     all_results: Dict[str, Dict] = {}
     eval_baselines = bool(cfg.get("eval_baselines", True))
-    rllib_algos = {"ppo", "a2c", "impala", "dqn", "rainbow"}
+    rllib_algos = {"ppo", "a2c", "impala", "dqn", "rainbow", "appo"}
     algo_name = str(cfg.get("algo", "")).lower()
     for seed in eval_seeds:
         print(f"[eval] Start seed {seed}")
@@ -68,6 +68,8 @@ def evaluate(cfg):
             reward_clip=cfg.get("reward_clip", 0.0),
             capacity_damage=cfg.get("capacity_damage", 1e-3),
             unassigned_penalty=cfg.get("unassigned_penalty", 2e7),
+            fixed_damage=cfg.get("fixed_damage", False),
+            fixed_damage_seed=cfg.get("fixed_damage_seed"),
             seed=seed,
         )
 
@@ -164,6 +166,8 @@ def evaluate(cfg):
                     "reward_clip": cfg.get("reward_clip", 0.0),
                     "capacity_damage": cfg.get("capacity_damage", 1e-3),
                     "unassigned_penalty": cfg.get("unassigned_penalty", 2e7),
+                    "fixed_damage": cfg.get("fixed_damage", False),
+                    "fixed_damage_seed": cfg.get("fixed_damage_seed"),
                     "reward_scale": reward_scale,
                     "max_steps": max_steps,
                     "seed": seed,

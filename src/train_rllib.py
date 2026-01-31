@@ -11,14 +11,25 @@ import torch
 import yaml
 import ray
 from ray.rllib.models import ModelCatalog
+from tqdm import tqdm
 
 from src.data.tntp_download import download_sioux_falls
 from src.data.tntp_parser import load_graph_data
 from src.env.repair_env import RepairEnv
 from src.rl.rllib_env import RepairEnvGym
-from src.rl.rllib_models import GATMaskedPolicyModel, GATMaskedQModel
+from src.rl.rllib_models import GATMaskedPolicyModel, GATMaskedQModel, GATMaskedDQNTorchModel
 from src.rl.rllib_utils import run_rllib_episode
 
+
+from ray.rllib.algorithms.callbacks import DefaultCallbacks
+
+class MyCallbacks(DefaultCallbacks):
+    def on_episode_end(self, *, worker, base_env, policies, episode, env_index, **kwargs):
+        # Extract custom metrics from info
+        last_info = episode.last_info_for()
+        if last_info:
+            if "tstt" in last_info:
+                episode.custom_metrics["tstt_last"] = last_info["tstt"]
 
 def _apply_seed_override(cfg: Dict) -> Dict:
     seed_override = os.environ.get("SEED_OVERRIDE")
@@ -27,6 +38,7 @@ def _apply_seed_override(cfg: Dict) -> Dict:
     seed = int(seed_override)
     cfg = dict(cfg)
     cfg["seed"] = seed
+    cfg["eval_seeds"] = [seed]
     output_dir = cfg["output_dir"]
     cfg["output_dir"] = os.path.join(output_dir, f"seed_{seed}")
     model_dir = cfg.get("model_dir", output_dir)
@@ -42,9 +54,9 @@ def _resolve_model_config(cfg: Dict, graph) -> Dict:
         assignment_method=cfg.get("assignment_method", "msa"),
         use_cugraph=cfg.get("use_cugraph", False),
         use_torch=cfg.get("use_torch_bpr", False),
-        device=cfg.get("env_device", "cpu"),
+        device=cfg.get("env_device", cfg.get("device", "cpu")),
         sp_backend=cfg.get("env_sp_backend", cfg.get("sp_backend", "auto")),
-        force_gpu_sp=cfg.get("env_force_gpu_sp", False),
+        force_gpu_sp=cfg.get("env_force_gpu_sp", cfg.get("force_gpu_sp", False)),
         reward_mode=cfg.get("reward_mode", "log_delta"),
         reward_alpha=cfg.get("reward_alpha", 1.0),
         reward_beta=cfg.get("reward_beta", 10.0),
@@ -52,6 +64,8 @@ def _resolve_model_config(cfg: Dict, graph) -> Dict:
         reward_clip=cfg.get("reward_clip", 0.0),
         capacity_damage=cfg.get("capacity_damage", 1e-3),
         unassigned_penalty=cfg.get("unassigned_penalty", 2e7),
+        fixed_damage=cfg.get("fixed_damage", False),
+        fixed_damage_seed=cfg.get("fixed_damage_seed"),
         seed=cfg["seed"],
     )
     state = sample_env.get_state()
@@ -68,13 +82,19 @@ def _resolve_model_config(cfg: Dict, graph) -> Dict:
 def _register_models():
     ModelCatalog.register_custom_model("gat_masked_policy", GATMaskedPolicyModel)
     ModelCatalog.register_custom_model("gat_masked_q", GATMaskedQModel)
+    ModelCatalog.register_custom_model("gat_masked_dqn", GATMaskedDQNTorchModel)
 
 
 def _build_algorithm(cfg: Dict, model_cfg: Dict, env_config: Dict):
     algo = str(cfg.get("algo", "ppo")).lower()
     num_workers = int(cfg.get("num_workers", 0))
+    num_envs_per_worker = int(cfg.get("num_envs_per_worker", 1))
     rollout_fragment = cfg.get("rollout_fragment_length", "auto")
-    num_gpus = 1 if str(cfg.get("device", "cpu")).startswith("cuda") else 0
+    batch_mode = cfg.get("batch_mode", "truncate_episodes")
+    sample_timeout_s = cfg.get("sample_timeout_s")
+    # Allow fractional GPUs if configured, otherwise default to 1 if cuda else 0
+    default_gpus = 1 if str(cfg.get("device", "cpu")).startswith("cuda") else 0
+    num_gpus = float(cfg.get("num_gpus", default_gpus))
 
     if algo == "ppo":
         from ray.rllib.algorithms.ppo import PPOConfig
@@ -91,7 +111,13 @@ def _build_algorithm(cfg: Dict, model_cfg: Dict, env_config: Dict):
                 sgd_minibatch_size=cfg.get("sgd_minibatch_size", cfg.get("batch_size", 512)),
                 num_sgd_iter=cfg.get("ppo_epochs", 10),
             )
-            .rollouts(num_rollout_workers=num_workers, rollout_fragment_length=rollout_fragment, batch_mode="complete_episodes")
+            .rollouts(
+                num_rollout_workers=num_workers,
+                num_envs_per_worker=num_envs_per_worker,
+                rollout_fragment_length=rollout_fragment,
+                batch_mode=batch_mode,
+                sample_timeout_s=sample_timeout_s,
+            )
             .resources(num_gpus=num_gpus)
         )
     elif algo == "a2c":
@@ -109,7 +135,13 @@ def _build_algorithm(cfg: Dict, model_cfg: Dict, env_config: Dict):
                 lr=cfg["lr"],
                 model={"custom_model": "gat_masked_policy", "custom_model_config": model_cfg},
             )
-            .rollouts(num_rollout_workers=num_workers, rollout_fragment_length=rollout_fragment, batch_mode="complete_episodes")
+            .rollouts(
+                num_rollout_workers=num_workers,
+                num_envs_per_worker=num_envs_per_worker,
+                rollout_fragment_length=rollout_fragment,
+                batch_mode=batch_mode,
+                sample_timeout_s=sample_timeout_s,
+            )
             .resources(num_gpus=num_gpus)
         )
     elif algo == "impala":
@@ -124,7 +156,34 @@ def _build_algorithm(cfg: Dict, model_cfg: Dict, env_config: Dict):
                 lr=cfg["lr"],
                 model={"custom_model": "gat_masked_policy", "custom_model_config": model_cfg},
             )
-            .rollouts(num_rollout_workers=num_workers, rollout_fragment_length=rollout_fragment, batch_mode="complete_episodes")
+            .rollouts(
+                num_rollout_workers=num_workers,
+                num_envs_per_worker=num_envs_per_worker,
+                rollout_fragment_length=rollout_fragment,
+                batch_mode=batch_mode,
+                sample_timeout_s=sample_timeout_s,
+            )
+            .resources(num_gpus=num_gpus)
+        )
+    elif algo == "appo":
+        from ray.rllib.algorithms.appo import APPOConfig
+
+        algo_config = (
+            APPOConfig()
+            .environment(env=RepairEnvGym, env_config=env_config)
+            .framework("torch")
+            .training(
+                gamma=cfg["gamma"],
+                lr=cfg["lr"],
+                model={"custom_model": "gat_masked_policy", "custom_model_config": model_cfg},
+            )
+            .rollouts(
+                num_rollout_workers=num_workers,
+                num_envs_per_worker=num_envs_per_worker,
+                rollout_fragment_length=rollout_fragment,
+                batch_mode=batch_mode,
+                sample_timeout_s=sample_timeout_s,
+            )
             .resources(num_gpus=num_gpus)
         )
     elif algo in {"dqn", "rainbow"}:
@@ -138,13 +197,13 @@ def _build_algorithm(cfg: Dict, model_cfg: Dict, env_config: Dict):
             .training(
                 gamma=cfg["gamma"],
                 lr=cfg["lr"],
-                model={"custom_model": "gat_masked_q", "custom_model_config": model_cfg},
+                model={"custom_model": "gat_masked_dqn", "custom_model_config": model_cfg},
                 train_batch_size=cfg.get("train_batch_size", cfg.get("batch_size", 512)),
                 replay_buffer_config={
                     "type": "MultiAgentReplayBuffer",
                     "capacity": int(cfg.get("buffer_size", 1000000)),
+                    "learning_starts": int(cfg.get("batch_start", 2000)),
                 },
-                learning_starts=int(cfg.get("batch_start", 2000)),
                 double_q=bool(cfg.get("double_q", True)),
                 dueling=bool(cfg.get("dueling", True)),
                 noisy=bool(cfg.get("noisy", enable_rainbow)),
@@ -153,11 +212,20 @@ def _build_algorithm(cfg: Dict, model_cfg: Dict, env_config: Dict):
                 v_min=float(cfg.get("v_min", -200000.0)),
                 v_max=float(cfg.get("v_max", 200000.0)),
             )
-            .rollouts(num_rollout_workers=num_workers, rollout_fragment_length=rollout_fragment, batch_mode="complete_episodes")
+            .rollouts(
+                num_rollout_workers=num_workers,
+                num_envs_per_worker=num_envs_per_worker,
+                rollout_fragment_length=rollout_fragment,
+                batch_mode=batch_mode,
+                sample_timeout_s=sample_timeout_s,
+            )
             .resources(num_gpus=num_gpus)
         )
     else:
         raise ValueError(f"Unsupported algo: {algo}")
+
+    # Debug: Force eager execution for better debugging
+    # algo_config.framework(framework="torch", eager_tracing=False)
 
     return algo_config.build()
 
@@ -183,9 +251,9 @@ def train(cfg: Dict):
         "assignment_method": cfg.get("assignment_method", "msa"),
         "use_cugraph": cfg.get("use_cugraph", False),
         "use_torch_bpr": cfg.get("use_torch_bpr", False),
-        "device": cfg.get("env_device", "cpu"),
+        "device": cfg.get("env_device", cfg.get("device", "cpu")),
         "sp_backend": cfg.get("env_sp_backend", cfg.get("sp_backend", "auto")),
-        "force_gpu_sp": cfg.get("env_force_gpu_sp", False),
+        "force_gpu_sp": cfg.get("env_force_gpu_sp", cfg.get("force_gpu_sp", False)),
         "reward_mode": cfg.get("reward_mode", "log_delta"),
         "reward_alpha": cfg.get("reward_alpha", 1.0),
         "reward_beta": cfg.get("reward_beta", 10.0),
@@ -193,6 +261,8 @@ def train(cfg: Dict):
         "reward_clip": cfg.get("reward_clip", 0.0),
         "capacity_damage": cfg.get("capacity_damage", 1e-3),
         "unassigned_penalty": cfg.get("unassigned_penalty", 2e7),
+        "fixed_damage": cfg.get("fixed_damage", False),
+        "fixed_damage_seed": cfg.get("fixed_damage_seed"),
         "reward_scale": cfg.get("reward_scale", 1.0),
         "max_steps": cfg.get("max_steps", 0),
         "seed": seed,
@@ -202,11 +272,20 @@ def train(cfg: Dict):
     _register_models()
 
     ray.init(ignore_reinit_error=True, include_dashboard=False)
+
+    print(f"Initializing Algorithm: {cfg.get('algo', 'ppo')}")
+    print(f"Config: {cfg}")
     algo = _build_algorithm(cfg, model_cfg, env_config)
+    print("Algorithm initialized successfully.")
 
     output_dir = cfg["output_dir"]
     model_dir = cfg.get("model_dir", output_dir)
-    os.makedirs(output_dir, exist_ok=True)
+
+    if os.path.exists(output_dir):
+        print(f"Output directory exists: {output_dir}")
+    else:
+        print(f"Creating output directory: {output_dir}")
+        os.makedirs(output_dir, exist_ok=True)
     os.makedirs(model_dir, exist_ok=True)
 
     episodes_target = int(cfg.get("episodes", 1000))
@@ -216,6 +295,7 @@ def train(cfg: Dict):
     best_eval_tstt = float("inf")
     metrics: List[Dict] = []
     next_eval = eval_every
+    pbar = tqdm(total=episodes_target, desc=f"Training {cfg.get('algo', 'PPO').upper()}")
 
     def save_checkpoint(tag: str):
         ckpt_dir = os.path.join(model_dir, tag)
@@ -223,10 +303,22 @@ def train(cfg: Dict):
         with open(os.path.join(model_dir, f"checkpoint_{tag}.txt"), "w", encoding="utf-8") as f:
             f.write(checkpoint_path)
 
+    print("Starting training loop...")
     while True:
         result = algo.train()
+        
         episodes_total = int(result.get("episodes_total", 0))
         timesteps_total = int(result.get("timesteps_total", 0))
+        reward_mean = float(result.get("episode_reward_mean", 0.0))
+        
+        print(f"DEBUG: Iteration done. Episodes: {episodes_total}, Timesteps: {timesteps_total}, Reward: {reward_mean:.4f}")
+        
+        # Ensure pbar updates correctly even if episodes_total jumps
+        delta = episodes_total - pbar.n
+        if delta > 0:
+            pbar.update(delta)
+        pbar.set_description(f"Reward: {reward_mean:.4f}")
+        
         metrics.append(
             {
                 "episodes_total": episodes_total,
@@ -251,6 +343,8 @@ def train(cfg: Dict):
             next_eval += eval_every
         if episodes_total >= episodes_target:
             break
+            
+    pbar.close()
 
     save_checkpoint("last")
     out_path = os.path.join(output_dir, "train_metrics.json")

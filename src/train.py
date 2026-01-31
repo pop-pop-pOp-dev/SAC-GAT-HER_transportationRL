@@ -6,6 +6,7 @@ import random
 import time
 import multiprocessing as mp
 import queue
+import logging
 from dataclasses import dataclass
 from typing import List, Tuple
 
@@ -155,6 +156,8 @@ def rollout_worker(worker_id, cfg, weights_queue, out_queue, stop_event):
         reward_clip=cfg.get("reward_clip", 0.0),
         capacity_damage=cfg.get("capacity_damage", 1e-3),
         unassigned_penalty=cfg.get("unassigned_penalty", 2e7),
+        fixed_damage=cfg.get("fixed_damage", False),
+        fixed_damage_seed=cfg.get("fixed_damage_seed"),
         debug_reward=False,
         seed=cfg["seed"] + 1000 + worker_id,
     )
@@ -217,6 +220,33 @@ def train(cfg):
         cfg["seed"] = int(seed_override)
         cfg["output_dir"] = os.path.join(cfg["output_dir"], f"seed_{cfg['seed']}")
         cfg["model_dir"] = cfg["output_dir"]
+    
+    # Setup logging
+    os.makedirs(cfg["output_dir"], exist_ok=True)
+    log_dir = os.path.join(cfg["output_dir"], "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    
+    # Configure root logger
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    
+    # Remove existing handlers
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+        
+    # File handler
+    file_handler = logging.FileHandler(os.path.join(log_dir, "training.log"))
+    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
+    logger.addHandler(file_handler)
+    
+    # Stream handler (console)
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(logging.Formatter('%(message)s'))
+    logger.addHandler(stream_handler)
+    
+    logger.info(f"Training started with seed {cfg['seed']}")
+    logger.info(f"Output directory: {cfg['output_dir']}")
+
     data_paths = download_sioux_falls(cfg["data_dir"])
     graph = load_graph_data(data_paths["net_path"], data_paths["trips_path"])
     env = RepairEnv(
@@ -238,6 +268,8 @@ def train(cfg):
         reward_clip=cfg.get("reward_clip", 0.0),
         capacity_damage=cfg.get("capacity_damage", 1e-3),
         unassigned_penalty=cfg.get("unassigned_penalty", 2e7),
+        fixed_damage=cfg.get("fixed_damage", False),
+        fixed_damage_seed=cfg.get("fixed_damage_seed"),
         debug_reward=cfg.get("debug_reward", False),
         debug_reward_every=cfg.get("debug_reward_every", 0),
         seed=cfg["seed"],
@@ -309,6 +341,12 @@ def train(cfg):
     alpha_max = cfg.get("alpha_max")
     save_best = bool(cfg.get("save_best", True))
     best_eval_tstt = float("inf")
+    # Early stopping parameters
+    early_stop_patience = int(cfg.get("early_stop_patience", 500))
+    early_stop_min_delta = float(cfg.get("early_stop_min_delta", 0.0))
+    best_tstt_mean = float("inf")
+    patience_counter = 0
+
     eval_every = int(cfg.get("eval_every", 50))
     eval_seeds = cfg.get("eval_seeds") or [1001, 1002, 1003, 1004, 1005]
     smooth_window = int(cfg.get("smooth_window", 10))
@@ -371,6 +409,24 @@ def train(cfg):
                 "tstt_auc": tstt_auc,
             }
         )
+        
+        # Log episode metrics
+        log_msg = (
+            f"Ep: {episode_idx} | "
+            f"Reward: {episode_reward:.4f} | "
+            f"TSTT Last: {last_tstt:.2f} | "
+            f"TSTT Mean: {tstt_mean:.2f} | "
+            f"Delta: {delta_tstt:.2f}"
+        )
+        if last_losses:
+            log_msg += (
+                f" | Critic: {last_losses.get('critic_loss', 0.0):.4f} | "
+                f"Actor: {last_losses.get('actor_loss', 0.0):.4f} | "
+                f"Alpha: {last_losses.get('alpha', 0.0):.4f} | "
+                f"Ent: {last_losses.get('policy_entropy', 0.0):.4f}"
+            )
+        logger.info(log_msg)
+
         writer.add_scalar("train/delta_tstt", delta_tstt, episode_idx)
         reward_hist.append(episode_reward)
         tstt_mean_hist.append(tstt_mean)
@@ -557,9 +613,16 @@ def train(cfg):
                 reward_clip=cfg.get("reward_clip", 0.0),
                 capacity_damage=cfg.get("capacity_damage", 1e-3),
                 unassigned_penalty=cfg.get("unassigned_penalty", 2e7),
+                fixed_damage=cfg.get("fixed_damage", False),
+                fixed_damage_seed=cfg.get("fixed_damage_seed"),
                 seed=seed,
             )
-            state = eval_env.reset(damaged_ratio=cfg["damaged_ratio"])
+            # Ensure evaluation environment matches training fixed damage scenario if applicable
+            if cfg.get("fixed_damage", False):
+                state = eval_env.reset(damaged_ratio=cfg["damaged_ratio"]) # Fixed damage seed is handled in init
+            else:
+                state = eval_env.reset(damaged_ratio=cfg["damaged_ratio"])
+            
             done = False
             steps = 0
             total_reward = 0.0
@@ -590,6 +653,8 @@ def train(cfg):
         writer.add_scalar("eval/avg_reward", avg_reward, episode_idx)
         writer.add_scalar("eval/avg_tstt", avg_tstt, episode_idx)
         writer.add_scalar("eval/avg_auc", avg_auc, episode_idx)
+        
+        logger.info(f"[EVAL] Ep: {episode_idx} | Avg Reward: {avg_reward:.4f} | Avg TSTT: {avg_tstt:.2f} | Avg AUC: {avg_auc:.2f}")
 
         if save_best and avg_tstt < best_eval_tstt:
             best_eval_tstt = avg_tstt
@@ -825,6 +890,23 @@ def train(cfg):
                     if eval_every > 0 and episodes_done % eval_every == 0:
                         run_eval(episodes_done)
 
+                # Check early stopping (Global check)
+                if episodes_done > early_stop_patience:  # Only start checking after warmup period
+                    # Use a smoothed global metric or just the current episode's result if we want to be strict
+                    # Here we use the just-finished episode's mean TSTT from the worker
+                    current_tstt_mean = float(np.mean(worker_tstt[wid])) if worker_tstt[wid] else next_tstt
+                    
+                    if current_tstt_mean < best_tstt_mean - early_stop_min_delta:
+                        best_tstt_mean = current_tstt_mean
+                        patience_counter = 0
+                    else:
+                        patience_counter += 1
+
+                if patience_counter >= early_stop_patience:
+                    logger.info(f"Early stopping triggered at episode {episodes_done}. No improvement in TSTT Mean for {early_stop_patience} episodes.")
+                    stop_event.set()
+                    break
+        
         pbar.close()
         stop_event.set()
         for p in workers:
@@ -945,6 +1027,18 @@ def train(cfg):
             save_checkpoint(episode)
             if eval_every > 0 and (episode + 1) % eval_every == 0:
                 run_eval(episode + 1)
+            
+            # Check early stopping
+            tstt_mean = float(np.mean(episode_tstt)) if episode_tstt else env.tstt
+            if tstt_mean < best_tstt_mean - early_stop_min_delta:
+                best_tstt_mean = tstt_mean
+                patience_counter = 0
+            else:
+                patience_counter += 1
+            
+            if patience_counter >= early_stop_patience:
+                logger.info(f"Early stopping triggered at episode {episode}. No improvement in TSTT Mean for {early_stop_patience} episodes.")
+                break
 
     out_path = os.path.join(cfg["output_dir"], "train_metrics.npy")
     np.save(out_path, metrics)

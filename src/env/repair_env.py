@@ -44,6 +44,8 @@ class RepairEnv:
         gp_keep_paths: int = 3,
         debug_reward: bool = False,
         debug_reward_every: int = 0,
+        fixed_damage: bool = False,
+        fixed_damage_seed: int | None = None,
         seed: int = 0,
     ):
         self.graph_data = graph_data
@@ -73,6 +75,12 @@ class RepairEnv:
         self.debug_reward_every = debug_reward_every
         self._debug_step = 0
         self.rng = np.random.default_rng(seed)
+        self.fixed_damage = bool(fixed_damage)
+        self.fixed_damage_seed = fixed_damage_seed
+        self._fixed_damaged_indices = None
+        self._fixed_damage_rng = (
+            np.random.default_rng(fixed_damage_seed) if fixed_damage_seed is not None else None
+        )
 
         self.num_nodes = graph_data.num_nodes
         self.edges = graph_data.edges
@@ -88,6 +96,8 @@ class RepairEnv:
         self.total_demand = float(np.sum(list(self.graph_data.od_demand.values())))
         self.unassigned_demand = 0.0
         self.is_reset = True
+        
+        print(f"[RepairEnv] Initialized with backend={self.sp_backend}, device={self.device}, method={self.assignment_method}, iters={self.assignment_iters}")
 
         self._init_graph()
         self._init_betweenness()
@@ -158,24 +168,28 @@ class RepairEnv:
         damaged_count = max(1, int(self.num_edges * damaged_ratio))
         self.is_damaged = np.zeros(self.num_edges, dtype=np.float32)
         max_retries = 50
-        damaged_indices = None
-        for _ in range(max_retries):
-            candidate = self.rng.choice(self.num_edges, size=damaged_count, replace=False)
-            damaged_mask = np.zeros(self.num_edges, dtype=np.float32)
-            damaged_mask[candidate] = 1.0
-            active_edges = [
-                (u, v)
-                for u, v, data in self.nx_graph.edges(data=True)
-                if damaged_mask[data["edge_id"]] == 0
-            ]
-            if not active_edges:
-                continue
-            subgraph = self.nx_graph.edge_subgraph(active_edges).copy()
-            if nx.is_strongly_connected(subgraph):
-                damaged_indices = candidate
-                break
+        damaged_indices = self._fixed_damaged_indices if self.fixed_damage else None
         if damaged_indices is None:
-            damaged_indices = self.rng.choice(self.num_edges, size=damaged_count, replace=False)
+            rng = self._fixed_damage_rng if self.fixed_damage and self._fixed_damage_rng is not None else self.rng
+            for _ in range(max_retries):
+                candidate = rng.choice(self.num_edges, size=damaged_count, replace=False)
+                damaged_mask = np.zeros(self.num_edges, dtype=np.float32)
+                damaged_mask[candidate] = 1.0
+                active_edges = [
+                    (u, v)
+                    for u, v, data in self.nx_graph.edges(data=True)
+                    if damaged_mask[data["edge_id"]] == 0
+                ]
+                if not active_edges:
+                    continue
+                subgraph = self.nx_graph.edge_subgraph(active_edges).copy()
+                if nx.is_strongly_connected(subgraph):
+                    damaged_indices = candidate
+                    break
+            if damaged_indices is None:
+                damaged_indices = rng.choice(self.num_edges, size=damaged_count, replace=False)
+            if self.fixed_damage:
+                self._fixed_damaged_indices = damaged_indices
         self.is_damaged[damaged_indices] = 1.0
 
         self.capacities = self.initial_capacities.copy()
@@ -200,7 +214,9 @@ class RepairEnv:
         prev_tstt = self.tstt
         self.is_damaged[action_edge_id] = 0.0
         self.capacities[action_edge_id] = self.initial_capacities[action_edge_id]
+        
         self.compute_flow_assignment()
+        
         reward = self.compute_reward_with_goal(
             prev_tstt,
             self.tstt,
@@ -252,7 +268,20 @@ class RepairEnv:
             return reward
         elif mode == "rel_improve":
             base = self.initial_tstt if self.initial_tstt is not None else prev_tstt
-            delta = ((prev_tstt - curr_tstt) / max(base, 1.0)) * 100.0
+            # Action Value: Percentage improvement (0-100+)
+            delta_pct = ((prev_tstt - curr_tstt) / max(base, 1.0)) * 100.0
+            
+            # State Value: Penalty for high current TSTT (AUC Optimization)
+            # Penalize the remaining ratio relative to base
+            current_ratio = curr_tstt / max(base, 1.0)
+            time_penalty = 1.0 * current_ratio  # Increased from 0.1 to 1.0 to dominate reward when slow
+            
+            reward = alpha * delta_pct - time_penalty
+            complete_bonus = beta if self.is_goal_complete(goal_mask, damaged_mask) else 0.0
+            reward = reward + complete_bonus
+            if clip and clip > 0:
+                reward = float(np.clip(reward, -clip, clip))
+            return reward
         else:
             delta = prev_tstt - curr_tstt
         complete_bonus = beta if self.is_goal_complete(goal_mask, damaged_mask) else 0.0
@@ -275,7 +304,13 @@ class RepairEnv:
         if self.assignment_method == "gp":
             self._compute_flow_assignment_gp()
             return
+            
         t = self.compute_travel_time(self.flow)
+        
+        # Debug: check initial travel time
+        if np.any(np.isnan(t)) or np.any(np.isinf(t)):
+             print("[RepairEnv] Critical Error: Initial travel time has NaN/Inf!")
+             
         d_prev = None
         for it in range(self.assignment_iters):
             aux_flow, unassigned = self._all_or_nothing(t)
@@ -284,6 +319,7 @@ class RepairEnv:
                 if d_prev is None:
                     direction = d_fw
                 else:
+                    # Robustness: Add small epsilon to denom
                     num = float(np.dot(d_fw, d_fw - d_prev))
                     denom = float(np.dot(d_prev, d_prev)) + 1e-12
                     beta = max(0.0, num / denom)
@@ -297,6 +333,12 @@ class RepairEnv:
                 else:
                     step = 1.0 / (it + 1.0)
                 self.flow = (1 - step) * self.flow + step * aux_flow
+            
+            # Debug: Check flow validity
+            if np.any(np.isnan(self.flow)):
+                 print(f"[RepairEnv] Error: Flow became NaN at iter {it}")
+                 self.flow = np.nan_to_num(self.flow)
+                 
             t = self.compute_travel_time(self.flow)
             self.unassigned_demand = unassigned
 
@@ -623,10 +665,11 @@ class RepairEnv:
             return paths
 
     def compute_travel_time(self, flow: np.ndarray) -> np.ndarray:
+        # Fast path: use NumPy for small graphs if not using Torch
         if not self.use_torch:
             flow_np = np.asarray(flow, dtype=np.float32)
             cap = np.maximum(self.capacities, 1e-6)
-            vc = np.clip(flow_np / cap, 0.0, 4.0)
+            vc = np.clip(flow_np / cap, 0.0, 10.0) 
             t = self.t0 * (1.0 + self.bpr_alpha * (vc ** self.bpr_beta))
             damaged_mask = self.is_damaged > 0.5
             t = t.astype(np.float32)
@@ -634,14 +677,31 @@ class RepairEnv:
             return t
 
         import torch
+        
+        # Optimize: avoid creating new tensors every call if possible, or use in-place ops
+        # But for safety, we create them. Ensure on correct device.
+        if not isinstance(flow, torch.Tensor):
+             flow_t = torch.tensor(flow, dtype=torch.float32, device=self.device)
+        else:
+             flow_t = flow
 
-        flow_t = torch.tensor(flow, dtype=torch.float32, device=self.device)
-        cap_t = torch.tensor(self.capacities, dtype=torch.float32, device=self.device)
-        t0_t = torch.tensor(self.t0, dtype=torch.float32, device=self.device)
-        damaged_t = torch.tensor(self.is_damaged, dtype=torch.float32, device=self.device)
-        vc = torch.clamp(flow_t / torch.clamp(cap_t, min=1e-6), min=0.0, max=4.0)
+        # Cache constant tensors if possible (not done here for simplicity/safety)
+        cap_t = torch.as_tensor(self.capacities, dtype=torch.float32, device=self.device)
+        t0_t = torch.as_tensor(self.t0, dtype=torch.float32, device=self.device)
+        damaged_t = torch.as_tensor(self.is_damaged, dtype=torch.float32, device=self.device)
+        
+        # Clip VC ratio to prevent overflow in power operation
+        vc = torch.clamp(flow_t / torch.clamp(cap_t, min=1e-6), min=0.0, max=10.0)
+        
         t = t0_t * (1.0 + self.bpr_alpha * (vc ** self.bpr_beta))
-        t = torch.where(damaged_t > 0, torch.full_like(t, 1e6), t)
+        # Use where to handle damaged links
+        t = torch.where(damaged_t > 0, torch.tensor(1e6, device=self.device), t)
+        
+        # Check for NaN/Inf only if debug is needed, otherwise skip for speed
+        # if torch.isnan(t).any() or torch.isinf(t).any():
+        #      print("[RepairEnv] Warning: Travel time contains NaN/Inf. Clamping.")
+        #      t = torch.clamp(t, max=1e9)
+             
         return t.detach().cpu().numpy()
 
     def _path_edges_from_predecessors(self, origin: int, dest: int, pred_row: np.ndarray) -> List[int]:

@@ -1,16 +1,12 @@
 data_dir: ./data
-output_dir: /root/autodl-tmp/resilence/outputs
-model_dir: /root/autodl-tmp/resilence/outputs/pt
+output_dir: /root/autodl-tmp/resilence/outputs/ablations/reward_delta
+model_dir: /root/autodl-tmp/resilence/outputs/ablations/reward_delta/pt
 damaged_ratio: 0.3
 assignment_iters: 60
-# Optional schedule (uncomment/tune if needed):
-assignment_iters_start: 20
-assignment_iters_end: 120
-assignment_iters_warmup_episodes: 2000
 assignment_method: cfw
 use_cugraph: false
-sp_backend: torch
-force_gpu_sp: true
+sp_backend: scipy
+force_gpu_sp: false
 episodes: 2000
 buffer_size: 1000000
 batch_start: 2000
@@ -25,7 +21,7 @@ per_alpha: 0.6
 per_beta: 0.4
 per_eps: 1.0e-6
 reward_scale: 0.5
-reward_mode: rel_improve
+reward_mode: delta
 reward_alpha: 1.0
 reward_beta: 0.0
 reward_gamma: 0.0
@@ -60,8 +56,8 @@ share_critic_encoder: false
 seed: 42
 eval_seeds: [42]
 model_path: ./outputs/model.pt
-use_torch_bpr: true
-device: cuda
+use_torch_bpr: false
+device: cpu
 worker_sp_backend: scipy
 worker_use_torch_bpr: false
 worker_use_cugraph: false
